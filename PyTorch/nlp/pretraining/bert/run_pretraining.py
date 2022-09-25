@@ -4,6 +4,7 @@
 # Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
 
 """
+BERT Pretraining script
 export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
 mpirun -n 8 --bind-to core --map-by socket:PE=7 --rank-by core --report-bindings --allow-run-as-root \
@@ -16,9 +17,6 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
       --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=4 \
       --enable_packed_data_mode False --compute_threshold=-1
 """
-
-"""BERT finetuning runner."""
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
