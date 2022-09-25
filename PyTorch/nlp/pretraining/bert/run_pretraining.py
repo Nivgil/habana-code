@@ -105,6 +105,7 @@ def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, w
                                   drop_last=True, pin_memory=True)
     return train_dataloader, input_file
 
+
 class pretraining_dataset(Dataset):
 
     def __init__(self, input_file, max_pred_length, enable_packed_data_mode:bool=False):
@@ -160,6 +161,9 @@ class BertPretrainingCriterion(torch.nn.Module):
         next_sentence_loss = self.loss_fn(seq_relationship_score.view(-1, 2), next_sentence_labels.view(-1))
         total_loss = masked_lm_loss + next_sentence_loss
         return total_loss
+
+class ComputeTimeout(Exception):
+    pass
 
 
 def parse_arguments():
@@ -360,12 +364,14 @@ def unflatten_tensor(flat, tensor_list):
         offset += numel
     return outputs
 
+
 def update_tensors(grad_tensors, outputs):
     idx=0
     for grad in grad_tensors:
         grad.copy_(outputs[idx])
         idx+=1
     return outputs
+
 
 def setup_training(args):
 
@@ -660,6 +666,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
     return global_step
 
+
 def get_metadata_file_path(input_dir : str) -> str:
     norm_path = os.path.normpath(input_dir)
     head_tail = os.path.split(norm_path)
@@ -667,6 +674,7 @@ def get_metadata_file_path(input_dir : str) -> str:
     metadata_file_name = metadata_file_name + '_metadata.json'
     metadata_file_path = os.path.join(head_tail[0],metadata_file_name)
     return metadata_file_path
+
 
 def read_avg_seq_per_sample(input_dir : str, max_sequence_length) -> float:
     metadata = None
@@ -691,6 +699,7 @@ def read_avg_seq_per_sample(input_dir : str, max_sequence_length) -> float:
         assert False, f"Key {avg_seq_per_sample_key} not present in packed dataset metadata file: {metadata_file_path}"
     print(f"AVG_SEQ_PER_SAMPLE: {avg_seq_per_sample}")
     return avg_seq_per_sample
+
 
 def main():
     global timeout_sent
@@ -746,6 +755,33 @@ def main():
 
         if device.type == 'cuda':
             pool = ProcessPoolExecutor(1)
+
+        print('Registers hooks')
+        compute_logs = {
+            'start_compute': 0,
+            'threshold': 0,
+            'enable_drop': False
+        }
+
+        def get_hook_func(module_name: str):
+            def log_time(*args):
+                current_time_passed = (
+                        time.time() - compute_logs['start_compute'])
+                if compute_logs['enable_drop'] and (
+                        current_time_passed >= compute_logs['threshold']):
+                    raise ComputeTimeout(module_name)
+            return log_time
+
+        print('Registers hooks')
+        for name, module in model.named_modules():
+            if torch.distributed.get_rank() == 0:
+                print(name)
+            # if name.split('.')[-1].isdigit() or name.endswith('lm_head'):
+            #     module.register_forward_hook(
+            #         get_hook_func('_'.join([name, 'fwd'])))
+            #     module.register_backward_hook(
+            #         get_hook_func('_'.join([name, 'bwd'])))
+
         starting_time = time.time()
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
