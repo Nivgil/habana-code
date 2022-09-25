@@ -346,6 +346,12 @@ def parse_arguments():
                         default='False', type=lambda x: x.lower() == 'true',
                         help='use zero optimizer')
 
+    parser.add_argument("--compute_threshold",
+                        default=-1,
+                        type=float,
+                        help="Stop FWD/BWD when the threshold is reached."
+                             " units in seconds")
+
     args = parser.parse_args()
     args.fp16 = args.fp16 or args.amp
 
@@ -354,6 +360,7 @@ def parse_arguments():
         args.steps_this_run = args.max_steps
 
     return args
+
 
 def unflatten_tensor(flat, tensor_list):
     outputs = []
@@ -847,7 +854,7 @@ def main():
 
                 train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
 
-                compute_logs['threshold'] = 1.5
+                compute_logs['threshold'] = args.compute_threshold
                 iteration_number = (
                         training_steps % args.gradient_accumulation_steps)
                 compute_logs['enable_drop'] = iteration_number > 5 and (
