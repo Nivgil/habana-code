@@ -3,17 +3,19 @@
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
 # Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+export MASTER_ADDR="localhost"
+export MASTER_PORT="12345"
+mpirun -n 8 --bind-to core --map-by socket:PE=7 --rank-by core --report-bindings --allow-run-as-root \
+python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
+      --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
+      --config_file=./bert_config.json --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
+      --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints --use_fused_lamb \
+      --input_dir=${DATA_DIR} \
+      --train_batch_size=1024 --max_seq_length=128 --max_predictions_per_seq=20 --warmup_proportion=0.2843 \
+      --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=4 \
+      --enable_packed_data_mode False --compute_threshold=-1
+"""
 
 """BERT finetuning runner."""
 
@@ -95,9 +97,10 @@ class WorkerInitObj(object):
         np.random.seed(seed=self.seed + id)
         random.seed(self.seed + id)
 
+
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, worker_init):
     num_workers = 0 if args.use_habana else 4
-    train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length, enable_packed_data_mode=args.enable_packed_data_mode)
+    train_data = PretrainingDataset(input_file=input_file, max_pred_length=max_pred_length, enable_packed_data_mode=args.enable_packed_data_mode)
     train_sampler = RandomSampler(train_data)
     train_dataloader = DataLoader(train_data, sampler=train_sampler,
                                   batch_size=args.train_batch_size * args.n_pu,
@@ -106,7 +109,7 @@ def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, w
     return train_dataloader, input_file
 
 
-class pretraining_dataset(Dataset):
+class PretrainingDataset(Dataset):
 
     def __init__(self, input_file, max_pred_length, enable_packed_data_mode:bool=False):
         self.input_file = input_file
@@ -161,6 +164,7 @@ class BertPretrainingCriterion(torch.nn.Module):
         next_sentence_loss = self.loss_fn(seq_relationship_score.view(-1, 2), next_sentence_labels.view(-1))
         total_loss = masked_lm_loss + next_sentence_loss
         return total_loss
+
 
 class ComputeTimeout(Exception):
     pass
@@ -775,8 +779,7 @@ def main():
                         time.time() - compute_logs['start_compute'])
                 if compute_logs['enable_drop'] and (
                         current_time_passed >= compute_logs['threshold']):
-                    print(f'Simulated DROP at {module_name}')
-                    # raise ComputeTimeout(module_name)
+                    raise ComputeTimeout(module_name)
             return log_time
 
         print(f'Rank {torch.distributed.get_rank()} registers hooks')
@@ -824,7 +827,7 @@ def main():
 
             if restored_data_loader is None:
                 num_workers = 0 if args.use_habana else 4
-                train_data = pretraining_dataset(data_file, args.max_predictions_per_seq, args.enable_packed_data_mode)
+                train_data = PretrainingDataset(data_file, args.max_predictions_per_seq, args.enable_packed_data_mode)
                 train_sampler = RandomSampler(train_data)
                 train_dataloader = DataLoader(train_data, sampler=train_sampler,
                                               batch_size=args.train_batch_size * args.n_pu,
