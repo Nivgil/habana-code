@@ -452,6 +452,7 @@ def setup_training(args):
 
     return device, args
 
+
 def prepare_model_and_optimizer(args, device):
 
     # Prepare model
@@ -577,6 +578,7 @@ def prepare_model_and_optimizer(args, device):
     criterion = BertPretrainingCriterion(config.vocab_size)
 
     return model, optimizer, lr_scheduler, checkpoint, global_step, criterion
+
 
 def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
@@ -834,7 +836,7 @@ def main():
                                 positions=positions if args.enable_packed_data_mode else None,
                                 next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None)
                     else:
-                        print(f'Rank {torch.distributed.get_rank()} {len(input_mask)} {type(input_mask)}')
+                        print(f'Rank {torch.distributed.get_rank()} {input_mask.shape}')
                         prediction_scores, seq_relationship_score = model(
                                 input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
                                 positions=positions if args.enable_packed_data_mode else None,
