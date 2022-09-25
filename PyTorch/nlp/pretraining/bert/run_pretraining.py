@@ -772,15 +772,13 @@ def main():
                     raise ComputeTimeout(module_name)
             return log_time
 
-        print('Registers hooks')
+        print(f'Rank {torch.distributed.get_rank()} registers hooks')
         for name, module in model.named_modules():
-            if torch.distributed.get_rank() == 0:
-                print(name)
-            # if name.split('.')[-1].isdigit() or name.endswith('lm_head'):
-            #     module.register_forward_hook(
-            #         get_hook_func('_'.join([name, 'fwd'])))
-            #     module.register_backward_hook(
-            #         get_hook_func('_'.join([name, 'bwd'])))
+            if name.split('.')[-1].isdigit():
+                module.register_forward_hook(
+                    get_hook_func('_'.join([name, 'fwd'])))
+                module.register_backward_hook(
+                    get_hook_func('_'.join([name, 'bwd'])))
 
         starting_time = time.time()
         # Note: We loop infinitely over epochs, termination is handled via iteration count
