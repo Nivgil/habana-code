@@ -783,7 +783,7 @@ def main():
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
                 if torch.distributed.get_rank() == 0:
-                    print(f'registers forward hook to {name}')
+                    print(f'registers hook to {name}')
                 module.register_forward_hook(
                     get_hook_func('_'.join([name, 'fwd'])))
                 module.register_backward_hook(
@@ -856,16 +856,18 @@ def main():
 
                 train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
 
-                compute_logs['threshold'] = args.compute_threshold
-                iteration_number = (
-                        training_steps % args.gradient_accumulation_steps)
-                compute_logs['enable_drop'] = iteration_number > 5 and (
-                        compute_logs['threshold'] > 0)
-                compute_logs['start_compute'] = time.time()
-
                 if raw_train_start is None:
                     raw_train_start = time.time()
                 for step, batch in enumerate(train_iter):  # delayed update loop
+
+                    if (training_steps % args.gradient_accumulation_steps) == 0:
+                        compute_logs['threshold'] = args.compute_threshold
+                        iteration_number = (
+                                training_steps % args.gradient_accumulation_steps)
+                        compute_logs['enable_drop'] = iteration_number > 5 and (
+                                compute_logs['threshold'] > 0)
+                        compute_logs['start_compute'] = time.time()
+
 
                     training_steps += 1
 
