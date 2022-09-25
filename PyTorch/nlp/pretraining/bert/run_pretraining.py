@@ -756,7 +756,6 @@ def main():
         if device.type == 'cuda':
             pool = ProcessPoolExecutor(1)
 
-        print('Registers hooks')
         compute_logs = {
             'start_compute': 0,
             'threshold': 0,
@@ -769,7 +768,8 @@ def main():
                         time.time() - compute_logs['start_compute'])
                 if compute_logs['enable_drop'] and (
                         current_time_passed >= compute_logs['threshold']):
-                    raise ComputeTimeout(module_name)
+                    print(f'Simulated DROP at {module_name}')
+                    # raise ComputeTimeout(module_name)
             return log_time
 
         print(f'Rank {torch.distributed.get_rank()} registers hooks')
@@ -847,9 +847,16 @@ def main():
 
                 train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
 
+                compute_logs['threshold'] = 1.5
+                iteration_number = (
+                        training_steps % args.gradient_accumulation_steps)
+                compute_logs['enable_drop'] = iteration_number > 5 and (
+                        compute_logs['threshold'] > 0)
+                compute_logs['start_compute'] = time.time()
+
                 if raw_train_start is None:
                     raw_train_start = time.time()
-                for step, batch in enumerate(train_iter):
+                for step, batch in enumerate(train_iter):  # delayed update loop
 
                     training_steps += 1
 
