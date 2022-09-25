@@ -857,14 +857,6 @@ def main():
                 if raw_train_start is None:
                     raw_train_start = time.time()
                 for step, batch in enumerate(train_iter):  # delayed update loop
-
-                    if (training_steps % args.gradient_accumulation_steps) == 0:
-                        compute_logs['threshold'] = args.compute_threshold
-                        compute_logs['enable_drop'] = global_step > 5 and (
-                                compute_logs['threshold'] > 0)
-                        compute_logs['start_compute'] = time.time()
-                        print(f'STEP {global_step} compute logs {compute_logs}')
-
                     training_steps += 1
 
                     batch = [t.to(device) for t in batch]
@@ -876,36 +868,56 @@ def main():
                     if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                         torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
 
-                    if args.local_rank != -1 and not args.allreduce_post_accumulation \
-                                and (training_steps % args.gradient_accumulation_steps != 0):
-                        with model.no_sync():
+                    if (training_steps % args.gradient_accumulation_steps) == 0:
+                        #  TODO(ngiladi): wrap in a function
+                        #  TODO(ngiladi): include data loading time
+                        compute_logs['threshold'] = args.compute_threshold
+                        compute_logs['enable_drop'] = global_step > 5 and (
+                                compute_logs['threshold'] > 0)
+                        compute_logs['start_compute'] = time.time()
+                        print(f'STEP {global_step} compute logs {compute_logs}')
+                    try:
+                        if args.local_rank != -1 and not args.allreduce_post_accumulation \
+                                    and (training_steps % args.gradient_accumulation_steps != 0):
+                            with model.no_sync():
+                                prediction_scores, seq_relationship_score = model(
+                                    input_ids=input_ids,
+                                    token_type_ids=segment_ids,
+                                    attention_mask=input_mask,
+                                    enable_packed_data_mode=args.enable_packed_data_mode,
+                                    positions=positions if args.enable_packed_data_mode else None,
+                                    next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None
+                                )
+                        else:
                             prediction_scores, seq_relationship_score = model(
-                                input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
+                                input_ids=input_ids,
+                                token_type_ids=segment_ids,
+                                attention_mask=input_mask,
+                                enable_packed_data_mode=(
+                                    args.enable_packed_data_mode),
                                 positions=positions if args.enable_packed_data_mode else None,
-                                next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None)
-                    else:
-                        # print(f'Rank {torch.distributed.get_rank()} STEP {step}')
-                        prediction_scores, seq_relationship_score = model(
-                                input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
-                                positions=positions if args.enable_packed_data_mode else None,
-                                next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None)
+                                next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None
+                            )
 
-                    loss = criterion(
-                        prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
-                    if args.n_pu > 1:
-                        loss = loss.mean()  # mean() to average on multi-pu.
+                        loss = criterion(
+                            prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
+                        if args.n_pu > 1:
+                            loss = loss.mean()  # mean() to average on multi-pu.
 
-                    divisor = args.gradient_accumulation_steps
-                    if args.gradient_accumulation_steps > 1:
-                        if not args.allreduce_post_accumulation:
-                            # this division was merged into predivision
-                            loss = loss / args.gradient_accumulation_steps
-                            divisor = 1.0
-                    if args.fp16:
-                        with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                            scaled_loss.backward()
-                    else:
-                        loss.backward()
+                        divisor = args.gradient_accumulation_steps
+                        if args.gradient_accumulation_steps > 1:
+                            if not args.allreduce_post_accumulation:
+                                # this division was merged into predivision
+                                loss = loss / args.gradient_accumulation_steps
+                                divisor = 1.0
+                        if args.fp16:
+                            with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+                                scaled_loss.backward()
+                        else:
+                            loss.backward()
+                    except ComputeTimeout as e:
+                        print(f'Rank {torch.distributed.get_rank()} DROP at {e}')
+                        # TODO(ngiladi): correct divisor and loss value
 
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
@@ -936,7 +948,7 @@ def main():
                         average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
                         if (torch.distributed.is_initialized()):
                             average_loss /= get_world_size()
-                            torch.distributed.barrier()
+                            torch.distributed.barrier()  # TODO(ngiladi): not necessary
                             torch.distributed.all_reduce(average_loss)
                         final_loss = average_loss.item()
                         if is_main_process():
