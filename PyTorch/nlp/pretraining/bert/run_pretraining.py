@@ -877,7 +877,7 @@ def main():
                                 positions=positions if args.enable_packed_data_mode else None,
                                 next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None)
                     else:
-                        print(f'Rank {torch.distributed.get_rank()} STEP {step}')
+                        # print(f'Rank {torch.distributed.get_rank()} STEP {step}')
                         prediction_scores, seq_relationship_score = model(
                                 input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
                                 positions=positions if args.enable_packed_data_mode else None,
