@@ -824,10 +824,11 @@ def main():
                         input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
 
                     if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
-                        torch.distributed.barrier()
+                        torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
 
                     if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                 and (training_steps % args.gradient_accumulation_steps != 0):
+                        print(f'Rank {torch.distributed.get_rank()} {len(input_mask)} {type(input_mask)}')
                         with model.no_sync():
                             prediction_scores, seq_relationship_score = model(
                                 input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
