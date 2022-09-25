@@ -877,7 +877,6 @@ def main():
                         compute_logs['enable_drop'] = global_step > 5 and (
                                 compute_logs['threshold'] > 0)
                         compute_logs['start_compute'] = time.time()
-                        print(f'STEP {global_step} compute logs {compute_logs}')
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
