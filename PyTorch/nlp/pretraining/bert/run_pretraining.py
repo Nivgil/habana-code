@@ -782,6 +782,8 @@ def main():
         print(f'Rank {torch.distributed.get_rank()} registers hooks')
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
+                if torch.distributed.get_rank() == 0:
+                    print(f'registers forward hook to {name}')
                 module.register_forward_hook(
                     get_hook_func('_'.join([name, 'fwd'])))
                 module.register_backward_hook(
