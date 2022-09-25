@@ -777,7 +777,6 @@ def main():
                         time.time() - compute_logs['start_compute'])
                 if compute_logs['enable_drop'] and (
                         current_time_passed >= compute_logs['threshold']):
-                    print(f'Rank {torch.distributed.get_rank()} DROP after {current_time_passed:3.4}')
                     raise ComputeTimeout(module_name)
             return log_time
 
