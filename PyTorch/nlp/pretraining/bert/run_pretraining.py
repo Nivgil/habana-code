@@ -828,13 +828,13 @@ def main():
 
                     if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                 and (training_steps % args.gradient_accumulation_steps != 0):
-                        print(f'Rank {torch.distributed.get_rank()} {len(input_mask)} {type(input_mask)}')
                         with model.no_sync():
                             prediction_scores, seq_relationship_score = model(
                                 input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
                                 positions=positions if args.enable_packed_data_mode else None,
                                 next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None)
                     else:
+                        print(f'Rank {torch.distributed.get_rank()} {len(input_mask)} {type(input_mask)}')
                         prediction_scores, seq_relationship_score = model(
                                 input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, enable_packed_data_mode=args.enable_packed_data_mode,
                                 positions=positions if args.enable_packed_data_mode else None,
