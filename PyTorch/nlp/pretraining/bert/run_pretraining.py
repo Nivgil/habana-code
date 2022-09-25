@@ -228,7 +228,7 @@ def parse_arguments():
                              "E.g., 0.1 = 10%% of training.")
     parser.add_argument("--local_rank",
                         type=int,
-                        default=os.getenv('MPI_COMM_WORLD', -1),
+                        default=os.getenv('OMPI_COMM_WORLD_RANK', -1),
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed',
                         type=int,
