@@ -228,7 +228,7 @@ def parse_arguments():
                              "E.g., 0.1 = 10%% of training.")
     parser.add_argument("--local_rank",
                         type=int,
-                        default=os.getenv('LOCAL_RANK', -1),
+                        default=os.getenv('MPI_COMM_WORLD', -1),
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed',
                         type=int,
@@ -405,8 +405,11 @@ def setup_training(args):
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
+        os.environ['LOCAL_RANK'] = f'{args.local_rank}'
+        os.environ['WORLD_SIZE'] = '8'
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        print(f'Rank {torch.distributed.get_rank()} online')
         args.n_pu = 1
 
     if args.gradient_accumulation_steps == 1:
@@ -851,7 +854,7 @@ def main():
                     else:
                         loss.backward()
 
-                    if args.use_lazy_mode:
+                    if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
 
                     loss_list.append(loss)
@@ -860,7 +863,7 @@ def main():
                         lr_scheduler.step()  # learning rate warmup
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
 
-                    if args.use_lazy_mode:
+                    if args.use_lazy_mode and args.use_habana:
                             htcore.mark_step()
 
                     if global_step >= args.steps_this_run or timeout_sent or training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
