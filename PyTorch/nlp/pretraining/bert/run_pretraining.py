@@ -860,12 +860,10 @@ def main():
 
                     if (training_steps % args.gradient_accumulation_steps) == 0:
                         compute_logs['threshold'] = args.compute_threshold
-                        iteration_number = (
-                                training_steps % args.gradient_accumulation_steps)
-                        compute_logs['enable_drop'] = iteration_number > 5 and (
+                        compute_logs['enable_drop'] = global_step > 5 and (
                                 compute_logs['threshold'] > 0)
                         compute_logs['start_compute'] = time.time()
-                        print(f'STEP {iteration_number} compute logs {compute_logs}')
+                        print(f'STEP {global_step} compute logs {compute_logs}')
 
                     training_steps += 1
 
