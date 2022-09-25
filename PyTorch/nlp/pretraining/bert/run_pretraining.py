@@ -782,8 +782,6 @@ def main():
         print(f'Rank {torch.distributed.get_rank()} registers hooks')
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
-                if torch.distributed.get_rank() == 0:
-                    print(f'registers hook to {name}')
                 module.register_forward_hook(
                     get_hook_func('_'.join([name, 'fwd'])))
                 module.register_backward_hook(
@@ -867,7 +865,7 @@ def main():
                         compute_logs['enable_drop'] = iteration_number > 5 and (
                                 compute_logs['threshold'] > 0)
                         compute_logs['start_compute'] = time.time()
-
+                        print(f'STEP {iteration_number} compute logs {compute_logs}')
 
                     training_steps += 1
 
