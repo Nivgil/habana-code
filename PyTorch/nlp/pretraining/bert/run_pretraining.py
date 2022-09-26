@@ -967,16 +967,16 @@ def main():
                             torch.distributed.all_reduce(average_loss)
                         final_loss = average_loss.item()
                         if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"final_loss": final_loss,
-                                                                            "average_training_time_step": average_training_time_per_step,
-                                                                            "average_perf_per_step": average_perf_per_step})
+                            dllogger.log(step=(epoch, global_step, ), data={"final_loss": f'{final_loss:3.4}',
+                                                                            "average_training_time_step": f'{average_training_time_per_step:3.4}',
+                                                                            "average_perf_per_step": f'{average_perf_per_step:3.4}'})
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
-                                                                            "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
-                                                                            "learning_rate": optimizer.param_groups[0]['lr'],
-                                                                            "average_training_time_step": average_training_time_per_step,
-                                                                            "average_perf_per_step": average_perf_per_step})
+                            dllogger.log(step=(epoch, global_step, ), data={"average_loss": f'{average_loss / (args.log_freq * divisor):3.4}',
+                                                                            "step_loss": f'{loss.item() * args.gradient_accumulation_steps / divisor:3.4}',
+                                                                            "learning_rate": f'{optimizer.param_groups[0]["lr"]:3.4}',
+                                                                            "average_training_time_step": f'{average_training_time_per_step:3.4}',
+                                                                            "average_perf_per_step": f'{average_perf_per_step:3.4}'})
                         average_loss = 0
 
 
