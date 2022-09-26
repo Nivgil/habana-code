@@ -877,7 +877,6 @@ def main():
                     if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                         torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
 
-                    print(f'input ids - {len(input_ids)} input_mask - {input_mask.shape}')
                     if (training_steps % args.gradient_accumulation_steps) == 0:
                         #  TODO(ngiladi): wrap in a function
                         #  TODO(ngiladi): include data loading time
@@ -890,7 +889,8 @@ def main():
                             print(f'Rank {torch.distributed.get_rank()} STEP'
                                   f' {global_step - 1} layer sample size'
                                   f' {compute_logs["layer_sample_size"]}')
-                        dict.fromkeys(compute_logs['layer_sample_size'].keys(), 0)
+                        for layer in compute_logs['layer_sample_size'].keys():
+                            compute_logs['layer_sample_size'][layer] = 0
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
