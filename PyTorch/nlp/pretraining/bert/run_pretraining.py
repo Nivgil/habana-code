@@ -767,20 +767,25 @@ def main():
         if device.type == 'cuda':
             pool = ProcessPoolExecutor(1)
 
+        layers_number = 0
+        for name, module in model.named_modules():
+            if name.split('.')[-1].isdigit():
+                layers_number += 1
+
         compute_logs = {
             'start_compute': 0,
             'threshold': 0,
             'enable_drop': False,
-            'layer_sample_size': {},
+            'layer_sample_size': torch.zeros(layers_number, device=device),
             'mini_batch_size': 0
         }
 
-        def get_hook_func(module_name: str):
+        def get_hook_func(module_name: str, layer_index: int):
             def log_time(*args):
                 current_time_passed = (
                         time.time() - compute_logs['start_compute'])
                 if 'bwd' in module_name:
-                    compute_logs['layer_sample_size'][module_name] += (
+                    compute_logs['layer_sample_size'][layer_index] += (
                         compute_logs['mini_batch_size'])
                 if compute_logs['enable_drop'] and (
                         current_time_passed >= compute_logs['threshold']):
@@ -790,11 +795,12 @@ def main():
         print(f'Rank {torch.distributed.get_rank()} registers hooks')
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
+                layer_number = int(name.split('.')[-1])
                 compute_logs['layer_sample_size']['_'.join([name, 'bwd'])] = 0
                 module.register_forward_hook(
-                    get_hook_func('_'.join([name, 'fwd'])))
+                    get_hook_func('_'.join([name, 'fwd']), layer_number))
                 module.register_backward_hook(
-                    get_hook_func('_'.join([name, 'bwd'])))
+                    get_hook_func('_'.join([name, 'bwd']), layer_number))
 
         starting_time = time.time()
         # Note: We loop infinitely over epochs, termination is handled via iteration count
@@ -889,8 +895,7 @@ def main():
                             print(f'Rank {torch.distributed.get_rank()} STEP'
                                   f' {global_step - 1} layer sample size'
                                   f' {compute_logs["layer_sample_size"]}')
-                        for layer in compute_logs['layer_sample_size'].keys():
-                            compute_logs['layer_sample_size'][layer] = 0
+                        compute_logs['layer_sample_size'].zero_()
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
@@ -964,19 +969,32 @@ def main():
                         if (torch.distributed.is_initialized()):
                             average_loss /= get_world_size()
                             torch.distributed.barrier()  # TODO(ngiladi): not necessary
-                            torch.distributed.all_reduce(average_loss)
+                            torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
                         final_loss = average_loss.item()
+                        #  TODO(ngiladi): improve logging format and wrap in a function
                         if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"final_loss": f'{final_loss:3.4}',
-                                                                            "average_training_time_step": f'{average_training_time_per_step:3.4}',
-                                                                            "average_perf_per_step": f'{average_perf_per_step:3.4}'})
+                            dllogger.log(step=(epoch, global_step, ), data={
+                                "final_loss":
+                                    f'{final_loss:3.4}',
+                                "average_training_time_step":
+                                    f'{average_training_time_per_step:3.4}',
+                                "average_perf_per_step":
+                                    f'{average_perf_per_step:3.4}'
+                            })
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"average_loss": f'{average_loss / (args.log_freq * divisor):3.4}',
-                                                                            "step_loss": f'{loss.item() * args.gradient_accumulation_steps / divisor:3.4}',
-                                                                            "learning_rate": f'{optimizer.param_groups[0]["lr"]:3.4}',
-                                                                            "average_training_time_step": f'{average_training_time_per_step:3.4}',
-                                                                            "average_perf_per_step": f'{average_perf_per_step:3.4}'})
+                            dllogger.log(step=(epoch, global_step, ), data={
+                                "average_loss":
+                                    f'{average_loss / (args.log_freq * divisor):3.4}',
+                                "step_loss":
+                                    f'{loss.item() * args.gradient_accumulation_steps / divisor:3.4}',
+                                "learning_rate":
+                                    f'{optimizer.param_groups[0]["lr"]:3.4}',
+                                "average_training_time_step":
+                                    f'{average_training_time_per_step:3.4}',
+                                "average_perf_per_step":
+                                    f'{average_perf_per_step:3.4}'
+                            })
                         average_loss = 0
 
 
