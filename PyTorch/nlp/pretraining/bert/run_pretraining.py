@@ -796,7 +796,6 @@ def main():
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
                 layer_number = int(name.split('.')[-1])
-                compute_logs['layer_sample_size']['_'.join([name, 'bwd'])] = 0
                 module.register_forward_hook(
                     get_hook_func('_'.join([name, 'fwd']), layer_number))
                 module.register_backward_hook(
