@@ -7,6 +7,7 @@
 BERT Pretraining script
 export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
+export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
 mpirun -n 8 --bind-to core --map-by socket:PE=7 --rank-by core --report-bindings --allow-run-as-root \
 python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
       --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
@@ -14,7 +15,7 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
       --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints --use_fused_lamb \
       --input_dir=${DATA_DIR} \
       --train_batch_size=1024 --max_seq_length=128 --max_predictions_per_seq=20 --warmup_proportion=0.2843 \
-      --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=4 \
+      --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=8 \
       --enable_packed_data_mode False --compute_threshold=-1
 """
 from __future__ import absolute_import
@@ -770,7 +771,7 @@ def main():
             'start_compute': 0,
             'threshold': 0,
             'enable_drop': False,
-            'layer_sample_size': collections.defaultdict(int),
+            'layer_sample_size': {},
             'mini_batch_size': 0
         }
 
@@ -789,6 +790,7 @@ def main():
         print(f'Rank {torch.distributed.get_rank()} registers hooks')
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
+                compute_logs['layer_sample_size']['_'.join([name, 'bwd'])] = 0
                 module.register_forward_hook(
                     get_hook_func('_'.join([name, 'fwd'])))
                 module.register_backward_hook(
@@ -883,9 +885,10 @@ def main():
                                 compute_logs['threshold'] > 0)
                         compute_logs['start_compute'] = time.time()
                         compute_logs['mini_batch_size'] = len(input_ids)
-                        print(f'Rank {torch.distributed.get_rank()} STEP'
-                              f' {global_step - 1} layer sample size'
-                              f' {compute_logs["layer_sample_size"]}')
+                        if torch.distributed.get_rank() == 0:
+                            print(f'Rank {torch.distributed.get_rank()} STEP'
+                                  f' {global_step - 1} layer sample size'
+                                  f' {compute_logs["layer_sample_size"]}')
                         dict.fromkeys(compute_logs['layer_sample_size'].keys(), 0)
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
