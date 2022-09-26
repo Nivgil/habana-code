@@ -877,6 +877,7 @@ def main():
                     if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                         torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
 
+                    print(f'input ids - {len(input_ids)} input_mask - {input_mask.shape}')
                     if (training_steps % args.gradient_accumulation_steps) == 0:
                         #  TODO(ngiladi): wrap in a function
                         #  TODO(ngiladi): include data loading time
