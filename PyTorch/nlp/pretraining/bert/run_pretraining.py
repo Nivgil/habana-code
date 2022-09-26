@@ -24,6 +24,7 @@ from __future__ import print_function
 # ==================
 import csv
 import os
+import collections
 import time
 import argparse
 import random
@@ -768,13 +769,18 @@ def main():
         compute_logs = {
             'start_compute': 0,
             'threshold': 0,
-            'enable_drop': False
+            'enable_drop': False,
+            'layer_sample_size': collections.defaultdict(int),
+            'mini_batch_size': 0
         }
 
         def get_hook_func(module_name: str):
             def log_time(*args):
                 current_time_passed = (
                         time.time() - compute_logs['start_compute'])
+                if 'bwd' in module_name:
+                    compute_logs['layer_sample_size'][module_name] += (
+                        compute_logs['mini_batch_size'])
                 if compute_logs['enable_drop'] and (
                         current_time_passed >= compute_logs['threshold']):
                     raise ComputeTimeout(module_name)
@@ -876,6 +882,11 @@ def main():
                         compute_logs['enable_drop'] = global_step > 5 and (
                                 compute_logs['threshold'] > 0)
                         compute_logs['start_compute'] = time.time()
+                        compute_logs['mini_batch_size'] = len(input_ids)
+                        print(f'Rank {torch.distributed.get_rank()} STEP'
+                              f' {global_step - 1} layer sample size'
+                              f' {compute_logs["layer_sample_size"]}')
+                        dict.fromkeys(compute_logs['layer_sample_size'].keys(), 0)
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
