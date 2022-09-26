@@ -969,6 +969,7 @@ def main():
                             average_loss /= get_world_size()
                             torch.distributed.barrier()  # TODO(ngiladi): not necessary
                             torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
+                            torch.distributed.all_reduce(compute_logs['layer_sample_size'])
                         final_loss = average_loss.item()
                         #  TODO(ngiladi): improve logging format and wrap in a function
                         if is_main_process():
