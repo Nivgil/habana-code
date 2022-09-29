@@ -428,7 +428,7 @@ def setup_training(args):
         os.environ['RANK'] = f'{args.local_rank}'
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        print(f'Rank {torch.distributed.get_rank()} online')
+        print(f'Rank {torch.distributed.get_rank()} online dist init {torch.distributed.is_initialized()}')
         args.n_pu = 1
 
     if args.gradient_accumulation_steps == 1:
