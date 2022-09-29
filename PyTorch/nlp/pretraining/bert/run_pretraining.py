@@ -894,10 +894,9 @@ def main():
                                 compute_logs['threshold'] > 0)
                         compute_logs['start_compute'] = time.time()
                         compute_logs['mini_batch_size'] = len(input_ids)
-                        if torch.distributed.get_rank() == 0:
-                            print(f'Rank {torch.distributed.get_rank()} STEP'
-                                  f' {global_step - 1} layer sample size'
-                                  f' {compute_logs["layer_sample_size"]}')
+                        print(f'Rank {torch.distributed.get_rank()} STEP'
+                              f' {global_step - 1} compute logs \t'
+                              f'{compute_logs}')
                         compute_logs['layer_sample_size'].zero_()
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
