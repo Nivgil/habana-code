@@ -886,18 +886,6 @@ def main():
                     if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                         torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
 
-                    if (training_steps % args.gradient_accumulation_steps) == 0:
-                        #  TODO(ngiladi): wrap in a function
-                        #  TODO(ngiladi): include data loading time
-                        compute_logs['threshold'] = args.compute_threshold
-                        compute_logs['enable_drop'] = global_step > 5 and (
-                                compute_logs['threshold'] > 0)
-                        compute_logs['start_compute'] = time.time()
-                        compute_logs['mini_batch_size'] = len(input_ids)
-                        # print(f'Rank {torch.distributed.get_rank()} STEP'
-                        #       f' {global_step - 1} compute logs \t'
-                        #       f'{compute_logs}')
-                        compute_logs['layer_sample_size'].zero_()
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
@@ -948,15 +936,19 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
-                        print(f'Rank {torch.distributed.get_rank()} STEP'
-                              f' {global_step - 1} BEFORE all reduce compute logs \t'
-                              f'{compute_logs}')
                         torch.distributed.all_reduce(compute_logs['layer_sample_size'])
-                        torch.cuda.synchronize()
-                        print(f'Rank {torch.distributed.get_rank()} STEP'
-                              f' {global_step - 1} AFTER all reduce compute logs \t'
-                              f'{compute_logs}')
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        #  TODO(ngiladi): wrap in a function
+                        #  TODO(ngiladi): include data loading time
+                        compute_logs['threshold'] = args.compute_threshold
+                        compute_logs['enable_drop'] = global_step > 5 and (
+                                compute_logs['threshold'] > 0)
+                        compute_logs['start_compute'] = time.time()
+                        compute_logs['mini_batch_size'] = len(input_ids)
+                        print(f'Rank {torch.distributed.get_rank()} STEP'
+                              f' {global_step - 1} compute logs \t'
+                              f'{compute_logs}')
+                        compute_logs['layer_sample_size'].zero_()
 
                     if args.use_lazy_mode and args.use_habana:
                             htcore.mark_step()
