@@ -947,8 +947,8 @@ def main():
                         compute_logs['mini_batch_size'] = len(input_ids)
                         if is_main_process():
                             print(f'Rank {torch.distributed.get_rank()} STEP'
-                                  f' {global_step} compute logs \t'
-                                  f'{compute_logs}')
+                                  f' {global_step} compute logs '
+                                  f'{compute_logs["layer_sample_size"]}')
                         compute_logs['layer_sample_size'].zero_()
 
                     if args.use_lazy_mode and args.use_habana:
