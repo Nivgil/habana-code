@@ -830,9 +830,9 @@ def main():
 
             if torch.distributed.is_initialized() and get_world_size() > num_files:
                 remainder = get_world_size() % num_files
-                data_file = files[(f_start_id*get_world_size()+get_rank() + remainder*f_start_id)%num_files]
+                data_file = files[(f_start_id * get_world_size() + get_rank() + remainder * f_start_id) % num_files]
             else:
-                data_file = files[(f_start_id*get_world_size()+get_rank())%num_files]
+                data_file = files[(f_start_id * get_world_size() + get_rank()) % num_files]
 
             previous_file = data_file
 
@@ -853,18 +853,22 @@ def main():
             if args.allreduce_post_accumulation and not args.use_habana:
                 overflow_buf = torch.cuda.IntTensor([0])
 
-            for f_id in range(f_start_id + 1 , len(files)):
-
+            for f_id in range(f_start_id + 1, len(files)):
 
                 if get_world_size() > num_files:
-                    data_file = files[(f_id*get_world_size()+get_rank() + remainder*f_id)%num_files]
+                    data_file = files[(f_id * get_world_size() + get_rank() + remainder * f_id) % num_files]
                 else:
-                    data_file = files[(f_id*get_world_size()+get_rank())%num_files]
+                    data_file = files[(f_id * get_world_size() + get_rank()) % num_files]
 
                 previous_file = data_file
 
                 if device.type == 'cuda':
-                    dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init)
+                    dataset_future = pool.submit(create_pretraining_dataset,
+                                                 data_file,
+                                                 args.max_predictions_per_seq,
+                                                 shared_file_list,
+                                                 args,
+                                                 worker_init)
 
                 train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
 
@@ -965,7 +969,7 @@ def main():
                         last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
                         average_loss = average_loss / (last_num_steps * divisor)
                         average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
-                        if (torch.distributed.is_initialized()):
+                        if torch.distributed.is_initialized():
                             average_loss /= get_world_size()
                             torch.distributed.barrier()  # TODO(ngiladi): not necessary
                             torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
@@ -1008,24 +1012,35 @@ def main():
                             model_to_save = model.module if hasattr(model,
                                                                     'module') else model  # Only save the model it-self
                             if args.resume_step < 0 or not args.phase2:
-                                output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step))
+                                output_save_file = os.path.join(
+                                    args.output_dir,
+                                    "ckpt_{}.pt".format(global_step)
+                                )
                             else:
-                                output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
-                            checkpoint_dict ={}
+                                output_save_file = os.path.join(
+                                    args.output_dir,
+                                    "ckpt_{}.pt".format(
+                                        global_step + args.phase1_end_step)
+                                )
+                            checkpoint_dict = {}
                             if args.do_train:
                                 if args.use_habana or args.no_cuda:
-                                    checkpoint_dict = {'model': model_to_save.state_dict(),
-                                                'optimizer': optimizer.state_dict(),
-                                                'files': [f_id] + files,
-                                                'epoch': epoch,
-                                                'data_loader': None if global_step >= args.max_steps else train_dataloader}
+                                    checkpoint_dict = {
+                                        'model': model_to_save.state_dict(),
+                                        'optimizer': optimizer.state_dict(),
+                                        'files': [f_id] + files,
+                                        'epoch': epoch,
+                                        'data_loader': None if global_step >= args.max_steps else train_dataloader
+                                    }
                                 else:
-                                    checkpoint_dict = {'model': model_to_save.state_dict(),
-                                                'optimizer': optimizer.state_dict(),
-                                                'master params': list(amp.master_params(optimizer)),
-                                                'files': [f_id] + files,
-                                                'epoch': epoch,
-                                                'data_loader': None if global_step >= args.max_steps else train_dataloader}
+                                    checkpoint_dict = {
+                                        'model': model_to_save.state_dict(),
+                                        'optimizer': optimizer.state_dict(),
+                                        'master params':
+                                            list(amp.master_params(optimizer)),
+                                        'files': [f_id] + files,
+                                        'epoch': epoch,
+                                        'data_loader': None if global_step >= args.max_steps else train_dataloader}
 
                                 torch.save(checkpoint_dict, output_save_file)
                                 most_recent_ckpts_paths.append(output_save_file)
@@ -1050,8 +1065,9 @@ def main():
                     train_dataloader, data_file = create_pretraining_dataset(data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init)
 
             epoch += 1
-    if args.use_lazy_mode:
+    if args.use_lazy_mode and args.use_habana:
         os.environ.pop("PT_HPU_LAZY_MODE")
+
 
 if __name__ == "__main__":
 
