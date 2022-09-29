@@ -772,7 +772,7 @@ def main():
             if name.split('.')[-1].isdigit():
                 layers_number += 1
 
-        compute_logs = {
+        compute_logs = {  # TODO(ngiladi): convert to dataclass/class
             'start_compute': 0,
             'threshold': 0,
             'enable_drop': False,
@@ -883,8 +883,8 @@ def main():
                     else:
                         input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
 
-                    if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
-                        torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
+                    # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
+                    #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
 
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
