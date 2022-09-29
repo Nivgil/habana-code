@@ -428,7 +428,7 @@ def setup_training(args):
         os.environ['RANK'] = f'{args.local_rank}'
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        print(f'Rank {torch.distributed.get_rank()} online dist init {torch.distributed.is_initialized()}')
+        print(f'Rank {torch.distributed.get_rank()} online')
         args.n_pu = 1
 
     if args.gradient_accumulation_steps == 1:
@@ -949,6 +949,7 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
+                        torch.distributed.all_reduce(compute_logs['layer_sample_size'])
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
 
                     if args.use_lazy_mode and args.use_habana:
@@ -963,7 +964,7 @@ def main():
                         average_training_time_per_step = train_time/(args.gradient_accumulation_steps * args.log_freq)
                         average_perf_per_step = args.train_batch_size*avg_seq_per_pack/average_training_time_per_step
 
-                    if global_step >= args.steps_this_run or timeout_sent:
+                    if global_step >= args.steps_this_run or timeout_sent:  # end of training
                         train_time_raw = time.time() - raw_train_start
                         last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
                         last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
@@ -973,10 +974,6 @@ def main():
                             average_loss /= get_world_size()
                             torch.distributed.barrier()  # TODO(ngiladi): not necessary
                             torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
-                            print(f'Rank {torch.distributed.get_rank()} all reduce checkpoint')
-                            torch.distributed.all_reduce(compute_logs['layer_sample_size'])
-                            torch.cuda.synchronize()
-                            print(f'Rank {torch.distributed.get_rank()} all reduce done {compute_logs["layer_sample_size"]}')
                         final_loss = average_loss.item()
                         #  TODO(ngiladi): improve logging format and wrap in a function
                         if is_main_process():
