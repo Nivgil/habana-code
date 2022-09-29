@@ -948,7 +948,7 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
-                        torch.distributed.all_reduce(compute_logs['layer_sample_size'])
+                        # torch.distributed.all_reduce(compute_logs['layer_sample_size'])
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
 
                     if args.use_lazy_mode and args.use_habana:
