@@ -52,6 +52,7 @@ from utils import is_main_process, format_step, get_world_size, get_rank
 from schedulers import LinearWarmUpScheduler
 
 try:
+    import apex
     from apex import amp
     from apex.optimizers import FusedLAMB
     from apex.parallel import DistributedDataParallel as DDP
@@ -66,7 +67,7 @@ except ImportError:
     else:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
-from lamb import NVLAMB
+import lamb
 
 import dllogger
 from concurrent.futures import ProcessPoolExecutor
@@ -83,11 +84,15 @@ timeout_sent = False
 import signal
 # handle SIGTERM sent from the scheduler and mark so we
 # can gracefully save & exit
+
+
 def signal_handler(sig, frame):
     global timeout_sent
     timeout_sent = True
 
+
 signal.signal(signal.SIGTERM, signal_handler)
+
 
 #Workaround because python functions are not picklable
 class WorkerInitObj(object):
@@ -427,7 +432,8 @@ def setup_training(args):
         os.environ['WORLD_SIZE'] = '8'
         os.environ['RANK'] = f'{args.local_rank}'
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        torch.distributed.init_process_group(backend='nccl',
+                                             init_method='env://')
         print(f'Rank {torch.distributed.get_rank()} online')
         args.n_pu = 1
 
@@ -436,35 +442,46 @@ def setup_training(args):
         args.allreduce_post_accumulation_fp16 = False
 
     if is_main_process():
-        dllogger.init(backends=[dllogger.JSONStreamBackend(verbosity=dllogger.Verbosity.VERBOSE,
-                                                           filename=args.json_summary),
-                                dllogger.StdOutBackend(verbosity=dllogger.Verbosity.VERBOSE, step_format=format_step)])
+        dllogger.init(backends=[
+            dllogger.JSONStreamBackend(
+                verbosity=dllogger.Verbosity.VERBOSE,
+                filename=args.json_summary),
+            dllogger.StdOutBackend(
+                verbosity=dllogger.Verbosity.VERBOSE,
+                step_format=format_step)
+        ])
     else:
         dllogger.init(backends=[])
 
-    print("device: {} n_pu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, args.n_pu, bool(args.local_rank != -1), args.fp16 or args.hmp))
+    print(f'device: {device} n_pu: {args.n_pu}, distributed training: '
+          f'{bool(args.local_rank != -1)}, 16-bits training: '
+          f'{args.fp16 or args.hmp}')
 
     if args.gradient_accumulation_steps < 1:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
-            args.gradient_accumulation_steps))
+        raise ValueError('Invalid gradient_accumulation_steps parameter: '
+                         f'{args.gradient_accumulation_steps}, should be >= 1')
     if args.train_batch_size % args.gradient_accumulation_steps != 0:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, batch size {} should be divisible".format(
-            args.gradient_accumulation_steps, args.train_batch_size))
+        raise ValueError('Invalid gradient_accumulation_steps parameter: '
+                         f'{args.gradient_accumulation_steps}, batch size '
+                         f'{args.train_batch_size} should be divisible')
 
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+    args.train_batch_size = (
+            args.train_batch_size // args.gradient_accumulation_steps)
 
     if args.enable_packed_data_mode:
-        args.gradient_accumulation_steps = round(args.gradient_accumulation_steps / avg_seq_per_pack)
+        args.gradient_accumulation_steps = round(
+            args.gradient_accumulation_steps / avg_seq_per_pack)
 
     if not args.do_train:
-        raise ValueError(" `do_train`  must be True.")
+        raise ValueError('`do_train` must be True.')
 
     if not args.resume_from_checkpoint and os.path.exists(args.output_dir) and (
-            os.listdir(args.output_dir) and any([i.startswith('ckpt') for i in os.listdir(args.output_dir)])):
-        raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
+            any([i.startswith('ckpt') for i in os.listdir(args.output_dir)])):
+        raise ValueError(f'Output directory ({args.output_dir}) already exists '
+                         'and is not empty.')
 
-    if (not args.resume_from_checkpoint or not os.path.exists(args.output_dir)) and is_main_process():
+    if (not args.resume_from_checkpoint or (
+            not os.path.exists(args.output_dir))) and is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
 
     return device, args
@@ -487,26 +504,30 @@ def prepare_model_and_optimizer(args, device):
         global_step = 0
     else:
         if args.resume_step == -1 and not args.init_checkpoint:
-            model_names = [f for f in os.listdir(args.output_dir) if f.endswith(".pt")]
+            model_names = [
+                f for f in os.listdir(args.output_dir) if f.endswith('.pt')]
             args.resume_step = max([int(x.split('.pt')[0].split('_')[1].strip()) for x in model_names])
 
         global_step = args.resume_step if not args.init_checkpoint else 0
 
         if not args.init_checkpoint:
-            checkpoint = torch.load(os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step)), map_location="cpu")
+            checkpoint = torch.load(
+                os.path.join(args.output_dir, f'ckpt_{global_step}.pt'),
+                map_location='cpu')
         else:
-            checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
+            checkpoint = torch.load(args.init_checkpoint, map_location='cpu')
 
         model.load_state_dict(checkpoint['model'], strict=False)
 
         if args.phase2 and not args.init_checkpoint:
             global_step -= args.phase1_end_step
         if is_main_process():
-            print("resume step from ", args.resume_step)
+            print(f'resume step from {args.resume_step}')
 
     model.to(device)
-    # BERT modeling  uses weight sharing between word embedding and prediction decoder.
-    # So make sure the storage is pointing properly even after model is moved to device.
+    # BERT modeling  uses weight sharing between word embedding and prediction
+    # decoder. So make sure the storage is pointing properly even after model is
+    # moved to device.
     if args.use_habana:
         model.cls.predictions.decoder.weight = model.bert.embeddings.word_embeddings.weight
 
@@ -522,26 +543,27 @@ def prepare_model_and_optimizer(args, device):
             try:
                 from habana_frameworks.torch.hpex.optimizers import FusedLamb
             except ImportError:
-                raise ImportError("Please install hbopt.")
+                raise ImportError('Please install hbopt.')
             optimizer_cls = FusedLamb
         else:
-            optimizer_cls = NVLAMB
+            optimizer_cls = lamb.NVLAMB
     else:
         if torch.cuda.is_available():
-            optimizer_cls = FusedLAMB
+            optimizer_cls = apex.optimizers.FusedLAMB
         else:
-            optimizer_cls = NVLAMB
+            optimizer_cls = lamb.NVLAMB
     if args.local_rank != -1 and args.use_zero_optimizer:
         optimizer = ZeroRedundancyOptimizer(
-                                    optimizer_grouped_parameters[0]['params'],
-                                    optimizer_class=optimizer_cls,
-                                    lr=args.learning_rate,
-                                    weight_decay=optimizer_grouped_parameters[0]['weight_decay'])
+            optimizer_grouped_parameters[0]['params'],
+            optimizer_class=optimizer_cls,
+            lr=args.learning_rate,
+            weight_decay=optimizer_grouped_parameters[0]['weight_decay']
+        )
         for pg in optimizer_grouped_parameters[1:]:
             optimizer.add_param_group(pg)
     else:
         optimizer = optimizer_cls(optimizer_grouped_parameters,
-                        lr=args.learning_rate)
+                                  lr=args.learning_rate)
 
     lr_scheduler = PolyWarmUpScheduler(optimizer,
                                        warmup=args.warmup_proportion,
@@ -549,9 +571,13 @@ def prepare_model_and_optimizer(args, device):
     if args.fp16:
 
         if args.loss_scale == 0:
-            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic", cast_model_outputs=torch.float16)
+            model, optimizer = amp.initialize(model, optimizer, opt_level='O2',
+                                              loss_scale='dynamic',
+                                              cast_model_outputs=torch.float16)
         else:
-            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, cast_model_outputs=torch.float16)
+            model, optimizer = amp.initialize(model, optimizer, opt_level='O2',
+                                              loss_scale=args.loss_scale,
+                                              cast_model_outputs=torch.float16)
         amp._amp_state.loss_scalers[0]._loss_scale = args.init_loss_scale
 
     model.checkpoint_activations(args.checkpoint_activations)
@@ -559,14 +585,15 @@ def prepare_model_and_optimizer(args, device):
     if args.resume_from_checkpoint:
         if args.phase2 or args.init_checkpoint:
             keys = list(checkpoint['optimizer']['state'].keys())
-            #Override hyperparameters from previous checkpoint
+            # override hyperparameters from previous checkpoint
             for key in keys:
                 checkpoint['optimizer']['state'][key]['step'] = global_step
-            for iter, item in enumerate(checkpoint['optimizer']['param_groups']):
-                checkpoint['optimizer']['param_groups'][iter]['step'] = global_step
-                checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
-                checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
-                checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
+            # TODO(ngiladi): change enumerate to range, only idx is used.
+            for idx, _ in enumerate(checkpoint['optimizer']['param_groups']):
+                checkpoint['optimizer']['param_groups'][idx]['step'] = global_step
+                checkpoint['optimizer']['param_groups'][idx]['t_total'] = args.max_steps
+                checkpoint['optimizer']['param_groups'][idx]['warmup'] = args.warmup_proportion
+                checkpoint['optimizer']['param_groups'][idx]['lr'] = args.learning_rate
         optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
         # Restore AMP master parameters
@@ -574,21 +601,30 @@ def prepare_model_and_optimizer(args, device):
             optimizer._lazy_init_maybe_master_weights()
             optimizer._amp_stash.lazy_init_called = True
             optimizer.load_state_dict(checkpoint['optimizer'])
-            for param, saved_param in zip(amp.master_params(optimizer), checkpoint['master params']):
+            for param, saved_param in zip(amp.master_params(optimizer),
+                                          checkpoint['master params']):
                 param.data.copy_(saved_param.data)
 
     if args.local_rank != -1:
         if not args.allreduce_post_accumulation:
             if args.use_habana:
-                model = DDP(model, bucket_cap_mb=230)
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    bucket_cap_mb=230
+                )
             else:
-                model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+                model = apex.parallel.DistributedDataParallelDDP(
+                    model,
+                    message_size=250_000_000,
+                    gradient_predivide_factor=get_world_size()
+                )
         else:
             if args.use_habana:
                 for param in model.parameters():
                     torch.distributed.broadcast(param.data, 0)
             else:
-                flat_dist_call([param.data for param in model.parameters()], torch.distributed.broadcast, (0,) )
+                flat_dist_call([param.data for param in model.parameters()],
+                               torch.distributed.broadcast, (0,))
     elif args.n_pu > 1:
         model = torch.nn.DataParallel(model)
 
@@ -656,7 +692,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
     else:
         #In case of parameter tying allreduce was called twice for the parameters.
         #Manually adding allreduce for the parameters.
-        if  args.use_habana and args.allreduce_post_accumulation:
+        if args.use_habana and args.allreduce_post_accumulation:
             grad_tensors = [param.grad for param in model.parameters() if param.grad is not None]
             flat_tensor = torch.cat([t.contiguous().view(-1) for t in grad_tensors], dim=0)
             flat_tensor.div_(float(torch.distributed.get_world_size() * args.gradient_accumulation_steps))
