@@ -787,9 +787,12 @@ def main():
     raw_train_start = None
     if args.do_train:
         if is_main_process():
-            dllogger.log(step="PARAMETER", data={"train_start": True})
-            dllogger.log(step="PARAMETER", data={"batch_size_per_pu": args.train_batch_size})
-            dllogger.log(step="PARAMETER", data={"learning_rate": args.learning_rate})
+            dllogger.log(step='PARAMETER',
+                         data={'train_start': True})
+            dllogger.log(step='PARAMETER',
+                         data={'batch_size_per_pu': args.train_batch_size})
+            dllogger.log(step='PARAMETER',
+                         data={'learning_rate': args.learning_rate})
 
         model.train()
         most_recent_ckpts_paths = []
@@ -838,17 +841,18 @@ def main():
                     get_hook_func('_'.join([name, 'bwd']), layer_number))
 
         starting_time = time.time()
-        # Note: We loop infinitely over epochs, termination is handled via iteration count
+        # loop infinitely over epochs, termination is handled via iteration
+        # count
         while True:
             thread = None
             restored_data_loader = None
             if not args.resume_from_checkpoint or epoch > 0 or (args.phase2 and global_step < 1) or args.init_checkpoint:
-                if args.enable_packed_data_mode:
-                    files = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir) if
-                             os.path.isfile(os.path.join(args.input_dir, f))] # Packed files have no 'training' pre/postfix.
-                else:
-                    files = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir) if
-                             os.path.isfile(os.path.join(args.input_dir, f)) and 'training' in f]
+                files = []
+                for file in os.listdir(args.input_dir):
+                    if os.path.isfile(os.path.join(args.input_dir, file)):
+                        # Packed files have no 'training' pre/postfix.
+                        if args.enable_packed_data_mode or 'training' in file:
+                            files.append(os.path.join(args.input_dir, file))
                 files.sort()
                 num_files = len(files)
                 random.Random(args.seed + epoch).shuffle(files)
@@ -864,7 +868,8 @@ def main():
 
             shared_file_list = {}
 
-            if torch.distributed.is_initialized() and get_world_size() > num_files:
+            if torch.distributed.is_initialized() and (
+                    get_world_size() > num_files):
                 remainder = get_world_size() % num_files
                 data_file = files[(f_start_id * get_world_size() + get_rank() + remainder * f_start_id) % num_files]
             else:
@@ -874,12 +879,18 @@ def main():
 
             if restored_data_loader is None:
                 num_workers = 0 if args.use_habana else 4
-                train_data = PretrainingDataset(data_file, args.max_predictions_per_seq, args.enable_packed_data_mode)
-                train_sampler = RandomSampler(train_data)
-                train_dataloader = DataLoader(train_data, sampler=train_sampler,
-                                              batch_size=args.train_batch_size * args.n_pu,
-                                              num_workers=num_workers, worker_init_fn=worker_init,
-                                              drop_last=True, pin_memory=True)
+                train_data = PretrainingDataset(data_file,
+                                                args.max_predictions_per_seq,
+                                                args.enable_packed_data_mode)
+                train_sampler = torch.utils.data.RandomSampler(train_data)
+                train_dataloader = torch.utils.data.DataLoader(
+                    train_data, sampler=train_sampler,
+                    batch_size=args.train_batch_size * args.n_pu,
+                    num_workers=num_workers,
+                    worker_init_fn=worker_init,
+                    drop_last=True,
+                    pin_memory=True
+                )
                 # shared_file_list["0"] = (train_dataloader, data_file)
             else:
                 train_dataloader = restored_data_loader
@@ -906,7 +917,13 @@ def main():
                                                  args,
                                                  worker_init)
 
-                train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+                if is_main_process():
+                    train_iter = tqdm(
+                        train_dataloader,
+                        desc="Iteration",
+                        disable=args.disable_progress_bar)
+                else:
+                    train_iter = train_dataloader
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
@@ -973,7 +990,8 @@ def main():
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
                         torch.distributed.all_reduce(compute_logs['layer_sample_size'])
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        global_step = take_optimizer_step(
+                            args, optimizer, model, overflow_buf, global_step)
                         #  TODO(ngiladi): wrap in a function
                         #  TODO(ngiladi): include data loading time
                         compute_logs['threshold'] = args.compute_threshold
@@ -1013,25 +1031,25 @@ def main():
                         #  TODO(ngiladi): improve logging format and wrap in a function
                         if is_main_process():
                             dllogger.log(step=(epoch, global_step, ), data={
-                                "final_loss":
+                                'final_loss':
                                     f'{final_loss:3.4}',
-                                "average_training_time_step":
+                                'average_training_time_step':
                                     f'{average_training_time_per_step:3.4}',
-                                "average_perf_per_step":
+                                'average_perf_per_step':
                                     f'{average_perf_per_step:3.4}'
                             })
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
                             dllogger.log(step=(epoch, global_step, ), data={
-                                "average_loss":
+                                'average_loss':
                                     f'{average_loss / (args.log_freq * divisor):3.4}',
-                                "step_loss":
+                                'step_loss':
                                     f'{loss.item() * args.gradient_accumulation_steps / divisor:3.4}',
-                                "learning_rate":
+                                'learning_rate':
                                     f'{optimizer.param_groups[0]["lr"]:3.4}',
-                                "average_training_time_step":
+                                'average_training_time_step':
                                     f'{average_training_time_per_step:3.4}',
-                                "average_perf_per_step":
+                                'average_perf_per_step':
                                     f'{average_perf_per_step:3.4}'
                             })
                         average_loss = 0
