@@ -22,36 +22,29 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-# ==================
-import csv
-from typing import Union
-import dataclasses
-import os
-import collections
-import time
 import argparse
-import random
+import dataclasses
+import dllogger
 import h5py
-from tqdm import tqdm, trange
-import os
 import numpy as np
-import torch
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.optim import ZeroRedundancyOptimizer
-import math
-import multiprocessing
-import sys
+import os
+import time
+from tqdm import tqdm
+from typing import Union
 import json
+from concurrent.futures import ProcessPoolExecutor
+import random
+import signal
 import warnings
 
-from tokenization import BertTokenizer
-import modeling
-from schedulers import PolyWarmUpScheduler
+import torch
+from torch.utils.data import Dataset
 
-from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
+import modeling
+import schedulers
+import lamb
+
 from utils import is_main_process, format_step, get_world_size, get_rank
-from schedulers import LinearWarmUpScheduler
 
 try:
     import apex
@@ -69,10 +62,6 @@ except ImportError:
     else:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
-import lamb
-
-import dllogger
-from concurrent.futures import ProcessPoolExecutor
 
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -82,10 +71,6 @@ avg_seq_per_pack = 1.0
 
 # Track whether a SIGTERM (cluster time up) has been handled
 timeout_sent = False
-
-import signal
-# handle SIGTERM sent from the scheduler and mark so we
-# can gracefully save & exit
 
 
 def signal_handler(sig, frame):
@@ -100,32 +85,44 @@ signal.signal(signal.SIGTERM, signal_handler)
 class WorkerInitObj(object):
     def __init__(self, seed):
         self.seed = seed
-    def __call__(self, id):
-        np.random.seed(seed=self.seed + id)
-        random.seed(self.seed + id)
+
+    def __call__(self, idx):
+        np.random.seed(self.seed + idx)
+        random.seed(self.seed + idx)
 
 
-def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, worker_init):
+def create_pretraining_dataset(input_file, max_pred_length, shared_list, args,
+                               worker_init):
     num_workers = 0 if args.use_habana else 4
-    train_data = PretrainingDataset(input_file=input_file, max_pred_length=max_pred_length, enable_packed_data_mode=args.enable_packed_data_mode)
-    train_sampler = RandomSampler(train_data)
-    train_dataloader = DataLoader(train_data, sampler=train_sampler,
-                                  batch_size=args.train_batch_size * args.n_pu,
-                                  num_workers=num_workers, worker_init_fn=worker_init,
-                                  drop_last=True, pin_memory=True)
+    train_data = PretrainingDataset(
+        input_file=input_file,
+        max_pred_length=max_pred_length,
+        enable_packed_data_mode=args.enable_packed_data_mode
+    )
+    train_sampler = torch.utils.data.RandomSampler(train_data)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data,
+        sampler=train_sampler,
+        batch_size=args.train_batch_size * args.n_pu,
+        num_workers=num_workers,
+        worker_init_fn=worker_init,
+        drop_last=True,
+        pin_memory=True
+    )
     return train_dataloader, input_file
 
 
-class PretrainingDataset(Dataset):
-
-    def __init__(self, input_file, max_pred_length, enable_packed_data_mode:bool=False):
+class PretrainingDataset(torch.utils.data.Dataset):
+    def __init__(self, input_file, max_pred_length,
+                 enable_packed_data_mode: bool = False):
         self.input_file = input_file
         self.max_pred_length = max_pred_length
         f = h5py.File(input_file, "r")
         if enable_packed_data_mode:
             keys = ['input_ids', 'input_mask', 'segment_ids', 'positions',
                     'masked_lm_positions', 'masked_lm_ids',
-                    'next_sentence_positions', 'next_sentence_labels', 'next_sentence_weights']
+                    'next_sentence_positions', 'next_sentence_labels',
+                    'next_sentence_weights']
         else:
             keys = ['input_ids', 'input_mask', 'segment_ids',
                     'masked_lm_positions', 'masked_lm_ids',
@@ -135,16 +132,32 @@ class PretrainingDataset(Dataset):
         self.enable_packed_data_mode = enable_packed_data_mode
 
     def __len__(self):
-        'Denotes the total number of samples'
+        """Denotes the total number of samples."""
         return len(self.inputs[0])
 
     def __getitem__(self, index):
         if self.enable_packed_data_mode:
-            [input_ids, input_mask, segment_ids, positions,
-             masked_lm_positions, masked_lm_ids,
-             next_sentence_positions, next_sentence_labels, next_sentence_weights] = [torch.from_numpy(input[index].astype(np.int64)) for input in self.inputs]
+            [
+                input_ids,
+                input_mask,
+                segment_ids,
+                positions,
+                masked_lm_positions,
+                masked_lm_ids,
+                next_sentence_positions,
+                next_sentence_labels,
+                next_sentence_weights
+            ] = [torch.from_numpy(
+                sample[index].astype(np.int64)) for sample in self.inputs]
         else:
-            [input_ids, input_mask, segment_ids, masked_lm_positions, masked_lm_ids, next_sentence_labels] = [torch.from_numpy(input[index].astype(np.int64)) if indice < 5 else torch.from_numpy(np.asarray(input[index].astype(np.int64))) for indice, input in enumerate(self.inputs)]
+            [
+                input_ids,
+                input_mask,
+                segment_ids,
+                masked_lm_positions,
+                masked_lm_ids,
+                next_sentence_labels
+            ] = [torch.from_numpy(sample[index].astype(np.int64)) if indice < 5 else torch.from_numpy(np.asarray(sample[index].astype(np.int64))) for indice, sample in enumerate(self.inputs)]
 
         masked_lm_labels = torch.ones(input_ids.shape, dtype=torch.long) * -1
         index = self.max_pred_length
@@ -156,9 +169,19 @@ class PretrainingDataset(Dataset):
 
         if self.enable_packed_data_mode:
             next_sentence_labels = (next_sentence_weights == 1) * next_sentence_labels + (next_sentence_weights == 0) * -1
-            return [input_ids, segment_ids, input_mask, positions, masked_lm_labels, next_sentence_positions, next_sentence_labels]
+            return [input_ids,
+                    segment_ids,
+                    input_mask,
+                    positions,
+                    masked_lm_labels,
+                    next_sentence_positions,
+                    next_sentence_labels]
         else:
-            return [input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels]
+            return [input_ids,
+                    segment_ids,
+                    input_mask,
+                    masked_lm_labels,
+                    next_sentence_labels]
 
 
 class BertPretrainingCriterion(torch.nn.Module):
@@ -166,9 +189,17 @@ class BertPretrainingCriterion(torch.nn.Module):
         super(BertPretrainingCriterion, self).__init__()
         self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
         self.vocab_size = vocab_size
-    def forward(self, prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels):
-        masked_lm_loss = self.loss_fn(prediction_scores.view(-1, self.vocab_size), masked_lm_labels.view(-1))
-        next_sentence_loss = self.loss_fn(seq_relationship_score.view(-1, 2), next_sentence_labels.view(-1))
+
+    def forward(self, prediction_scores, seq_relationship_score,
+                masked_lm_labels, next_sentence_labels):
+        masked_lm_loss = self.loss_fn(
+            prediction_scores.view(-1, self.vocab_size),
+            masked_lm_labels.view(-1)
+        )
+        next_sentence_loss = self.loss_fn(
+            seq_relationship_score.view(-1, 2),
+            next_sentence_labels.view(-1)
+        )
         total_loss = masked_lm_loss + next_sentence_loss
         return total_loss
 
@@ -412,16 +443,16 @@ def update_tensors(grad_tensors, outputs):
 
 
 def setup_training(args):
-
-    #assert (torch.cuda.is_available())
     if args.use_habana:
         device = torch.device("hpu")
 
         if args.hmp:
             print(args.hmp_bf16)
             from habana_frameworks.torch.hpex import hmp
-            hmp.convert(opt_level=args.hmp_opt_level, bf16_file_path=args.hmp_bf16,
-                    fp32_file_path=args.hmp_fp32, isVerbose=args.hmp_verbose)
+            hmp.convert(opt_level=args.hmp_opt_level,
+                        bf16_file_path=args.hmp_bf16,
+                        fp32_file_path=args.hmp_fp32,
+                        isVerbose=args.hmp_verbose)
 
         args.n_pu = 1
         from habana_frameworks.torch.distributed.hccl import initialize_distributed_hpu
@@ -533,7 +564,8 @@ def prepare_model_and_optimizer(args, device):
         if not args.init_checkpoint:
             checkpoint = torch.load(
                 os.path.join(args.output_dir, f'ckpt_{global_step}.pt'),
-                map_location='cpu')
+                map_location='cpu'
+            )
         else:
             checkpoint = torch.load(args.init_checkpoint, map_location='cpu')
 
@@ -573,7 +605,7 @@ def prepare_model_and_optimizer(args, device):
         else:
             optimizer_cls = lamb.NVLAMB
     if args.local_rank != -1 and args.use_zero_optimizer:
-        optimizer = ZeroRedundancyOptimizer(
+        optimizer = torch.distributed.optim.ZeroRedundancyOptimizer(
             optimizer_grouped_parameters[0]['params'],
             optimizer_class=optimizer_cls,
             lr=args.learning_rate,
@@ -585,11 +617,10 @@ def prepare_model_and_optimizer(args, device):
         optimizer = optimizer_cls(optimizer_grouped_parameters,
                                   lr=args.learning_rate)
 
-    lr_scheduler = PolyWarmUpScheduler(optimizer,
-                                       warmup=args.warmup_proportion,
-                                       total_steps=args.max_steps)
+    lr_scheduler = schedulers.PolyWarmUpScheduler(optimizer,
+                                                  warmup=args.warmup_proportion,
+                                                  total_steps=args.max_steps)
     if args.fp16:
-
         if args.loss_scale == 0:
             model, optimizer = amp.initialize(model, optimizer, opt_level='O2',
                                               loss_scale='dynamic',
@@ -734,7 +765,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
     return global_step
 
 
-def get_metadata_file_path(input_dir : str) -> str:
+def get_metadata_file_path(input_dir: str) -> str:
     norm_path = os.path.normpath(input_dir)
     head_tail = os.path.split(norm_path)
     metadata_file_name = head_tail[1]
@@ -743,7 +774,7 @@ def get_metadata_file_path(input_dir : str) -> str:
     return metadata_file_path
 
 
-def read_avg_seq_per_sample(input_dir : str, max_sequence_length) -> float:
+def read_avg_seq_per_sample(input_dir: str, max_sequence_length) -> float:
     metadata = None
     metadata_file_path = get_metadata_file_path(input_dir)
     print(f"Reading dataset metadata from: {metadata_file_path}")
@@ -1071,7 +1102,10 @@ def main():
 
                     if global_step >= args.steps_this_run or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0 or timeout_sent:
-                        if isinstance(optimizer, ZeroRedundancyOptimizer):
+                        if isinstance(
+                                optimizer,
+                                torch.distributed.optim.ZeroRedundancyOptimizer
+                        ):
                             optimizer.consolidate_state_dict()
                         if is_main_process() and not args.skip_checkpoint:
                             # Save a trained model
