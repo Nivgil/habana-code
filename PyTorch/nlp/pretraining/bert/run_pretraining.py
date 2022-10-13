@@ -16,7 +16,7 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
       --input_dir=${DATA_DIR} \
       --train_batch_size=1024 --max_seq_length=128 --max_predictions_per_seq=20 --warmup_proportion=0.2843 \
       --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=8 \
-      --enable_packed_data_mode False --compute_threshold=-1
+      --enable_packed_data_mode False --compute_threshold=-1 --disable_progress_bar
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -38,6 +38,7 @@ import signal
 import warnings
 
 import torch
+import torch.distributed
 from torch.utils.data import Dataset
 
 import modeling
@@ -237,7 +238,7 @@ def parse_arguments():
                         default=None,
                         type=str,
                         required=True,
-                        help="The input data dir. Should contain .hdf5 files  for the task.")
+                        help="The input data dir. Should contain .hdf5 files for the task.")
 
     parser.add_argument("--config_file",
                         default=None,
@@ -811,10 +812,12 @@ def main():
     torch.cuda.manual_seed(args.seed + args.local_rank)
     worker_init = WorkerInitObj(args.seed + args.local_rank)
     if args.enable_packed_data_mode:
-        avg_seq_per_pack = read_avg_seq_per_sample(args.input_dir, args.max_seq_length)
+        avg_seq_per_pack = read_avg_seq_per_sample(args.input_dir,
+                                                   args.max_seq_length)
     else:
-        warnings.warn("--enable_packed_data_mode flag will be deprecated and usage of packed and unpacked dataset"
-                      " will be decided based on metadata file availability at input_dir")
+        warnings.warn('--enable_packed_data_mode flag will be deprecated and '
+                      'usage of packed and unpacked dataset will be decided '
+                      'based on metadata file availability at input_dir')
         avg_seq_per_pack = 1.0
     device, args = setup_training(args)
 
