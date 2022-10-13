@@ -677,9 +677,9 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         # 4. combine unscaling and unflattening of allreduced gradient
         overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
-            overflow_buf,
-            [allreduced_views, master_grads],
-            1./loss_scale)
+                                 overflow_buf,
+                                 [allreduced_views, master_grads],
+                                 1./loss_scale)
         # 5. update loss scale
         if args.fp16:
             scaler = _amp_state.loss_scalers[0]
@@ -710,8 +710,8 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         for param in model.parameters():
             param.grad = None
     else:
-        #In case of parameter tying allreduce was called twice for the parameters.
-        #Manually adding allreduce for the parameters.
+        # In case of parameter tying allreduce was called twice for the
+        # parameters. Manually adding allreduce for the parameters.
         if args.use_habana and args.allreduce_post_accumulation:
             grad_tensors = [param.grad for param in model.parameters() if param.grad is not None]
             flat_tensor = torch.cat([t.contiguous().view(-1) for t in grad_tensors], dim=0)
