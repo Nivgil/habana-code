@@ -24,6 +24,8 @@ from __future__ import print_function
 
 # ==================
 import csv
+from typing import Union
+import dataclasses
 import os
 import collections
 import time
@@ -94,7 +96,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-#Workaround because python functions are not picklable
+# Workaround because python functions are not picklable
 class WorkerInitObj(object):
     def __init__(self, seed):
         self.seed = seed
@@ -173,6 +175,26 @@ class BertPretrainingCriterion(torch.nn.Module):
 
 class ComputeTimeout(Exception):
     pass
+
+
+@dataclasses.dataclass
+class ComputeState:
+    layer_sample_size: torch.Tensor
+    start_compute: float = 0
+    threshold: float = 0
+    enable_drop: bool = False
+    mini_batch_size: int = 0
+
+    def __init__(self, layers_number: int, device: Union[int, torch.device]):
+        self.layer_sample_size = torch.zeros(layers_number, device=device)
+
+    def reset_state(self, compute_threshold: float, enable_drop: bool,
+                    start_compute: float, mini_natch_size: int):
+        self.threshold = compute_threshold
+        self.enable_drop = enable_drop
+        self.start_compute = start_compute
+        self.mini_batch_size = mini_natch_size
+        self.layer_sample_size.zero_()
 
 
 def parse_arguments():
@@ -429,12 +451,10 @@ def setup_training(args):
         device = torch.device("cuda", args.local_rank)
         # TODO(ngiladi): rank==local_rank might cause error for multinode training
         os.environ['LOCAL_RANK'] = f'{args.local_rank}'
-        os.environ['WORLD_SIZE'] = '8'
+        os.environ['WORLD_SIZE'] = '4'
         os.environ['RANK'] = f'{args.local_rank}'
-        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl',
                                              init_method='env://')
-        print(f'Rank {torch.distributed.get_rank()} online')
         args.n_pu = 1
 
     if args.gradient_accumulation_steps == 1:
@@ -453,9 +473,9 @@ def setup_training(args):
     else:
         dllogger.init(backends=[])
 
-    print(f'device: {device} n_pu: {args.n_pu}, distributed training: '
-          f'{bool(args.local_rank != -1)}, 16-bits training: '
-          f'{args.fp16 or args.hmp}')
+    print(f'Rank: {torch.distributed.get_rank()} online.\tn_pu: {args.n_pu}, '
+          f'distributed training: {bool(args.local_rank != -1)}, '
+          f'16-bits training: {args.fp16 or args.hmp}')
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError('Invalid gradient_accumulation_steps parameter: '
@@ -811,23 +831,17 @@ def main():
             if name.split('.')[-1].isdigit():
                 layers_number += 1
 
-        compute_logs = {  # TODO(ngiladi): convert to dataclass/class
-            'start_compute': 0,
-            'threshold': 0,
-            'enable_drop': False,
-            'layer_sample_size': torch.zeros(layers_number, device=device),
-            'mini_batch_size': 0
-        }
+        compute_state = ComputeState(layers_number, device)
 
         def get_hook_func(module_name: str, layer_index: int):
             def log_time(*args):
                 current_time_passed = (
-                        time.time() - compute_logs['start_compute'])
+                        time.time() - compute_state.start_compute)
                 if 'bwd' in module_name:
-                    compute_logs['layer_sample_size'][layer_index] += (
-                        compute_logs['mini_batch_size'])
-                if compute_logs['enable_drop'] and (
-                        current_time_passed >= compute_logs['threshold']):
+                    compute_state.layer_sample_size[layer_index] += (
+                        compute_state.mini_batch_size)
+                if compute_state.enable_drop and (
+                        current_time_passed >= compute_state.threshold):
                     raise ComputeTimeout(module_name)
             return log_time
 
@@ -989,21 +1003,21 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
-                        torch.distributed.all_reduce(compute_logs['layer_sample_size'])
+                        torch.distributed.all_reduce(compute_state.layer_sample_size)
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
-                        #  TODO(ngiladi): wrap in a function
                         #  TODO(ngiladi): include data loading time
-                        compute_logs['threshold'] = args.compute_threshold
-                        compute_logs['enable_drop'] = global_step > 5 and (
-                                compute_logs['threshold'] > 0)
-                        compute_logs['start_compute'] = time.time()
-                        compute_logs['mini_batch_size'] = len(input_ids)
                         if is_main_process():
                             print(f'Rank {torch.distributed.get_rank()} STEP'
                                   f' {global_step} compute logs '
-                                  f'{compute_logs["layer_sample_size"]}')
-                        compute_logs['layer_sample_size'].zero_()
+                                  f'{compute_state.layer_sample_size}')
+                        compute_state.reset_state(
+                            compute_threshold=args.compute_threshold,
+                            enable_drop=(global_step > 5 and (
+                                    compute_state.threshold > 0)),
+                            start_compute=time.time(),
+                            mini_natch_size=len(input_ids)
+                        )
 
                     if args.use_lazy_mode and args.use_habana:
                             htcore.mark_step()
