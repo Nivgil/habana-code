@@ -485,10 +485,9 @@ def setup_training(args):
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
-        # TODO(ngiladi): rank==local_rank might cause error for multinode training
-        os.environ['LOCAL_RANK'] = f'{args.local_rank}'
-        os.environ['WORLD_SIZE'] = '4'
-        os.environ['RANK'] = f'{args.local_rank}'
+        os.environ['LOCAL_RANK'] = os.environ['OMPI_COMM_WORLD_LOCAL_RANK']
+        os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
+        os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
         torch.distributed.init_process_group(backend='nccl',
                                              init_method='env://')
         args.n_pu = 1
