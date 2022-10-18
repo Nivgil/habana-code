@@ -9,7 +9,7 @@ export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
 export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
 mpirun -n 4 --bind-to core --map-by socket:PE=4 --rank-by core --report-bindings --allow-run-as-root \
-python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
+python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp \
       --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
       --config_file=./bert_config.json --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
       --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints --use_fused_lamb \
