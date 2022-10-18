@@ -23,12 +23,15 @@ from __future__ import division
 from __future__ import print_function
 
 import argparse
+import collections
 import dataclasses
 import dllogger
 import h5py
 import numpy as np
 import os
 import time
+
+import pandas as pd
 from tqdm import tqdm
 from typing import Union
 import json
@@ -39,6 +42,7 @@ import warnings
 
 import torch
 import torch.distributed
+import torch.distributed.optim
 from torch.utils.data import Dataset
 
 import modeling
@@ -894,6 +898,7 @@ def main():
         starting_time = time.time()
         # loop infinitely over epochs, termination is handled via iteration
         # count
+        time_logs = collections.defaultdict(list)
         while True:
             thread = None
             restored_data_loader = None
@@ -978,6 +983,7 @@ def main():
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
+                time_logs['fwd_start'].append(time.time())
                 for step, batch in enumerate(train_iter):  # delayed update loop
                     training_steps += 1
 
@@ -1026,6 +1032,7 @@ def main():
                                 # this division was merged into predivision
                                 loss = loss / args.gradient_accumulation_steps
                                 divisor = 1.0
+                        time_logs['bwd_start'].append(time.time())
                         if args.fp16:
                             with amp.scale_loss(
                                     loss,
@@ -1038,6 +1045,8 @@ def main():
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
+                    torch.cuda.synchronize()
+                    time_logs['bwd_end'].append(time.time())
 
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
@@ -1051,10 +1060,10 @@ def main():
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
                         #  TODO(ngiladi): include data loading time
-                        if utils.is_main_process():
-                            print(f'Rank {utils.get_rank()} STEP'
-                                  f' {global_step} compute logs '
-                                  f'{compute_state.layer_sample_size}')
+                        # if utils.is_main_process():
+                        #     print(f'Rank {utils.get_rank()} STEP'
+                        #           f' {global_step} compute logs '
+                        #           f'{compute_state.layer_sample_size}')
                         compute_state.reset_state(
                             compute_threshold=args.compute_threshold,
                             enable_drop=(global_step > 5 and (
@@ -1164,10 +1173,12 @@ def main():
                         # Exiting the training due to hitting max steps, or being sent a
                         # timeout from the cluster scheduler
                         if global_step >= args.steps_this_run or timeout_sent:
+                            with open('test.csv', 'w') as file:
+                                file.write(pd.DataFrame(time_logs).to_csv())
                             del train_dataloader
                             # thread.join()
                             return args, final_loss, train_time_raw, global_step
-
+                    time_logs['fwd_start'].append(time.time())
                 del train_dataloader
                 # thread.join()
                 # Make sure pool has finished and switch train_dataloader
@@ -1175,8 +1186,13 @@ def main():
                 if device.type == 'cuda':
                     train_dataloader, data_file = dataset_future.result(timeout=None)
                 else:
-                    train_dataloader, data_file = create_pretraining_dataset(data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init)
-
+                    train_dataloader, data_file = create_pretraining_dataset(
+                        data_file,
+                        args.max_predictions_per_seq,
+                        shared_file_list,
+                        args,
+                        worker_init
+                    )
             epoch += 1
     if args.use_lazy_mode and args.use_habana:
         os.environ.pop("PT_HPU_LAZY_MODE")
@@ -1196,6 +1212,9 @@ if __name__ == "__main__":
         e2e_time = time.time() - now
         training_perf = args.train_batch_size * args.gradient_accumulation_steps * pu_count * avg_seq_per_pack\
                         * (global_step - args.resume_step + skipped_steps) / train_time_raw
-        dllogger.log(step=tuple(), data={"e2e_train_time": e2e_time, "training_sequences_per_second": training_perf,
-                                         "final_loss": final_loss, "raw_train_time": train_time_raw })
+        dllogger.log(step=tuple(),
+                     data={'e2e_train_time': e2e_time,
+                           'training_sequences_per_second': training_perf,
+                           'final_loss': final_loss,
+                           'raw_train_time': train_time_raw})
     dllogger.flush()
