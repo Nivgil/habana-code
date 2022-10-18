@@ -1047,7 +1047,8 @@ def main():
 
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     time_logs['bwd_end'].append(time.time())
 
                     loss_list.append(loss)
