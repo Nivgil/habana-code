@@ -1172,7 +1172,8 @@ def main():
                         # Exiting the training due to hitting max steps, or being sent a
                         # timeout from the cluster scheduler
                         if global_step >= args.steps_this_run or timeout_sent:
-                            with open('test.csv', 'w') as file:
+                            with open(f'compute_logs_{utils.get_rank()}.csv',
+                                      'w') as file:
                                 file.write(pd.DataFrame(time_logs).to_csv())
                             del train_dataloader
                             # thread.join()
