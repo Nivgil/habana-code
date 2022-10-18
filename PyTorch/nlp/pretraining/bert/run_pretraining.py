@@ -8,14 +8,14 @@ BERT Pretraining script
 export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
 export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
-mpirun -n 8 --bind-to core --map-by socket:PE=7 --rank-by core --report-bindings --allow-run-as-root \
+mpirun -n 4 --bind-to core --map-by socket:PE=4 --rank-by core --report-bindings --allow-run-as-root \
 python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
       --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
       --config_file=./bert_config.json --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
       --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints --use_fused_lamb \
       --input_dir=${DATA_DIR} \
       --train_batch_size=1024 --max_seq_length=128 --max_predictions_per_seq=20 --warmup_proportion=0.2843 \
-      --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=8 \
+      --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=32 \
       --enable_packed_data_mode False --compute_threshold=-1 --disable_progress_bar
 """
 from __future__ import absolute_import
@@ -45,7 +45,7 @@ import modeling
 import schedulers
 import lamb
 
-from utils import is_main_process, format_step, get_world_size, get_rank
+import utils
 
 try:
     import apex
@@ -493,19 +493,19 @@ def setup_training(args):
         args.allreduce_post_accumulation = False
         args.allreduce_post_accumulation_fp16 = False
 
-    if is_main_process():
+    if utils.is_main_process():
         dllogger.init(backends=[
             dllogger.JSONStreamBackend(
                 verbosity=dllogger.Verbosity.VERBOSE,
                 filename=args.json_summary),
             dllogger.StdOutBackend(
                 verbosity=dllogger.Verbosity.VERBOSE,
-                step_format=format_step)
+                step_format=utils.format_step)
         ])
     else:
         dllogger.init(backends=[])
 
-    print(f'Rank: {torch.distributed.get_rank()} online.\tn_pu: {args.n_pu}, '
+    print(f'Rank: {utils.get_rank()} online.\tn_pu: {args.n_pu}, '
           f'distributed training: {bool(args.local_rank != -1)}, '
           f'16-bits training: {args.fp16 or args.hmp}')
 
@@ -533,7 +533,7 @@ def setup_training(args):
                          'and is not empty.')
 
     if (not args.resume_from_checkpoint or (
-            not os.path.exists(args.output_dir))) and is_main_process():
+            not os.path.exists(args.output_dir))) and utils.is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
 
     return device, args
@@ -574,7 +574,7 @@ def prepare_model_and_optimizer(args, device):
 
         if args.phase2 and not args.init_checkpoint:
             global_step -= args.phase1_end_step
-        if is_main_process():
+        if utils.is_main_process():
             print(f'resume step from {args.resume_step}')
 
     model.to(device)
@@ -668,7 +668,7 @@ def prepare_model_and_optimizer(args, device):
                 model = apex.parallel.DistributedDataParallelDDP(
                     model,
                     message_size=250_000_000,
-                    gradient_predivide_factor=get_world_size()
+                    gradient_predivide_factor=utils.get_world_size()
                 )
         else:
             if args.use_habana:
@@ -700,10 +700,13 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
         overflow_buf.zero_()
-        amp_C.multi_tensor_scale(65536,
+        amp_C.multi_tensor_scale(
+            65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            loss_scale / (get_world_size() * args.gradient_accumulation_steps))
+            loss_scale / (
+                    utils.get_world_size() * args.gradient_accumulation_steps)
+        )
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
         torch.distributed.all_reduce(flat_raw)
         # 4. combine unscaling and unflattening of allreduced gradient
@@ -733,7 +736,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         else:
             # Overflow detected, print message and clear gradients
             skipped_steps += 1
-            if is_main_process():
+            if utils.is_main_process():
                 scaler = _amp_state.loss_scalers[0]
                 dllogger.log(step="PARAMETER", data={"loss_scale": scaler.loss_scale()})
             if _amp_state.opt_properties.master_weights:
@@ -835,12 +838,12 @@ def main():
     # Prepare optimizer
     model, optimizer, lr_scheduler, checkpoint, global_step, criterion = prepare_model_and_optimizer(args, device)
 
-    if is_main_process():
+    if utils.is_main_process():
         dllogger.log(step="PARAMETER", data={"SEED": args.seed})
 
     raw_train_start = None
     if args.do_train:
-        if is_main_process():
+        if utils.is_main_process():
             dllogger.log(step='PARAMETER',
                          data={'train_start': True})
             dllogger.log(step='PARAMETER',
@@ -879,7 +882,7 @@ def main():
                     raise ComputeTimeout(module_name)
             return log_time
 
-        print(f'Rank {torch.distributed.get_rank()} registers hooks')
+        print(f'Rank {utils.get_rank()} registers hooks')
         for name, module in model.named_modules():
             if name.split('.')[-1].isdigit():
                 layer_number = int(name.split('.')[-1])
@@ -917,11 +920,11 @@ def main():
             shared_file_list = {}
 
             if torch.distributed.is_initialized() and (
-                    get_world_size() > num_files):
-                remainder = get_world_size() % num_files
-                data_file = files[(f_start_id * get_world_size() + get_rank() + remainder * f_start_id) % num_files]
+                    utils.get_world_size() > num_files):
+                remainder = utils.get_world_size() % num_files
+                data_file = files[(f_start_id * utils.get_world_size() + utils.get_rank() + remainder * f_start_id) % num_files]
             else:
-                data_file = files[(f_start_id * get_world_size() + get_rank()) % num_files]
+                data_file = files[(f_start_id * utils.get_world_size() + utils.get_rank()) % num_files]
 
             previous_file = data_file
 
@@ -950,10 +953,10 @@ def main():
 
             for f_id in range(f_start_id + 1, len(files)):
 
-                if get_world_size() > num_files:
-                    data_file = files[(f_id * get_world_size() + get_rank() + remainder * f_id) % num_files]
+                if utils.get_world_size() > num_files:
+                    data_file = files[(f_id * utils.get_world_size() + utils.get_rank() + remainder * f_id) % num_files]
                 else:
-                    data_file = files[(f_id * get_world_size() + get_rank()) % num_files]
+                    data_file = files[(f_id * utils.get_world_size() + utils.get_rank()) % num_files]
 
                 previous_file = data_file
 
@@ -965,7 +968,7 @@ def main():
                                                  args,
                                                  worker_init)
 
-                if is_main_process():
+                if utils.is_main_process():
                     train_iter = tqdm(
                         train_dataloader,
                         desc="Iteration",
@@ -1027,7 +1030,7 @@ def main():
                         else:
                             loss.backward()
                     except ComputeTimeout as e:
-                        print(f'Rank {torch.distributed.get_rank()} DROP at {e}')
+                        print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
 
                     if args.use_lazy_mode and args.use_habana:
@@ -1037,12 +1040,13 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
-                        torch.distributed.all_reduce(compute_state.layer_sample_size)
+                        if torch.distributed.is_initialized():
+                            torch.distributed.all_reduce(compute_state.layer_sample_size)
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
                         #  TODO(ngiladi): include data loading time
-                        if is_main_process():
-                            print(f'Rank {torch.distributed.get_rank()} STEP'
+                        if utils.is_main_process():
+                            print(f'Rank {utils.get_rank()} STEP'
                                   f' {global_step} compute logs '
                                   f'{compute_state.layer_sample_size}')
                         compute_state.reset_state(
@@ -1072,12 +1076,12 @@ def main():
                         average_loss = average_loss / (last_num_steps * divisor)
                         average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
                         if torch.distributed.is_initialized():
-                            average_loss /= get_world_size()
+                            average_loss /= utils.get_world_size()
                             torch.distributed.barrier()  # TODO(ngiladi): not necessary
                             torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
                         final_loss = average_loss.item()
                         #  TODO(ngiladi): improve logging format and wrap in a function
-                        if is_main_process():
+                        if utils.is_main_process():
                             dllogger.log(step=(epoch, global_step, ), data={
                                 'final_loss':
                                     f'{final_loss:3.4}',
@@ -1087,7 +1091,7 @@ def main():
                                     f'{average_perf_per_step:3.4}'
                             })
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
-                        if is_main_process():
+                        if utils.is_main_process():
                             dllogger.log(step=(epoch, global_step, ), data={
                                 'average_loss':
                                     f'{average_loss / (args.log_freq * divisor):3.4}',
@@ -1110,7 +1114,7 @@ def main():
                                 torch.distributed.optim.ZeroRedundancyOptimizer
                         ):
                             optimizer.consolidate_state_dict()
-                        if is_main_process() and not args.skip_checkpoint:
+                        if utils.is_main_process() and not args.skip_checkpoint:
                             # Save a trained model
                             dllogger.log(step="PARAMETER", data={"checkpoint_step": global_step})
                             model_to_save = model.module if hasattr(model,
@@ -1182,8 +1186,8 @@ if __name__ == "__main__":
     if args.resume_step == -1:
         args.resume_step = 0
     if torch.distributed.is_initialized():
-        pu_count = get_world_size()
-    if is_main_process():
+        pu_count = utils.get_world_size()
+    if utils.is_main_process():
         e2e_time = time.time() - now
         training_perf = args.train_batch_size * args.gradient_accumulation_steps * pu_count * avg_seq_per_pack\
                         * (global_step - args.resume_step + skipped_steps) / train_time_raw
