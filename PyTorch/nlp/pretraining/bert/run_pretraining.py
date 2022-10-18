@@ -1013,8 +1013,10 @@ def main():
                                 next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None
                             )
 
-                        loss = criterion(
-                            prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
+                        loss = criterion(prediction_scores,
+                                         seq_relationship_score,
+                                         masked_lm_labels,
+                                         next_sentence_labels)
                         if args.n_pu > 1:
                             loss = loss.mean()  # mean() to average on multi-pu.
 
