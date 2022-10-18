@@ -1044,11 +1044,11 @@ def main():
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
-                    torch.cuda.synchronize()
-                    time_logs['bwd_end'].append(time.time())
 
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
+                    torch.cuda.synchronize()
+                    time_logs['bwd_end'].append(time.time())
 
                     loss_list.append(loss)
 
