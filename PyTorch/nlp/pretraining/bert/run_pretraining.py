@@ -1025,7 +1025,11 @@ def main():
                                 loss = loss / args.gradient_accumulation_steps
                                 divisor = 1.0
                         if args.fp16:
-                            with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+                            with amp.scale_loss(
+                                    loss,
+                                    optimizer,
+                                    delay_overflow_check=args.allreduce_post_accumulation
+                            ) as scaled_loss:
                                 scaled_loss.backward()
                         else:
                             loss.backward()
@@ -1105,7 +1109,6 @@ def main():
                                     f'{average_perf_per_step:3.4}'
                             })
                         average_loss = 0
-
 
                     if global_step >= args.steps_this_run or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0 or timeout_sent:
