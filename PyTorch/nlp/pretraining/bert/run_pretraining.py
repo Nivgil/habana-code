@@ -7,7 +7,8 @@
 BERT Pretraining script
 export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
-export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
+export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
+#export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
 mpirun -n 4 --bind-to core --map-by socket:PE=4 --rank-by core --report-bindings --allow-run-as-root \
 python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp \
       --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
@@ -17,6 +18,17 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp
       --train_batch_size=1024 --max_seq_length=128 --max_predictions_per_seq=20 --warmup_proportion=0.2843 \
       --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=32 \
       --enable_packed_data_mode False --compute_threshold=-1 --disable_progress_bar
+
+python run_pretraining.py --do_train --bert_model=bert-large-uncased \
+    --hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt \
+    --use_lazy_mode=True --config_file=./bert_config.json \
+    --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
+    --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints \
+    --use_fused_lamb --input_dir=${DATA_DIR} --train_batch_size=8192 \
+    --max_seq_length=128 --max_predictions_per_seq=20 \
+    --warmup_proportion=0.2843 --max_steps=7038 --num_steps_per_checkpoint=200 \
+    --learning_rate=0.006 --gradient_accumulation_steps=128 \
+    --enable_packed_data_mode True --disable_progress_bar --use_habana
 """
 from __future__ import absolute_import
 from __future__ import division
