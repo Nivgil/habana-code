@@ -525,7 +525,8 @@ def setup_training(args):
           f'distributed training: {bool(args.local_rank != -1)}, '
           f'16-bits training: {args.fp16 or args.hmp}')
 
-    x = torch.ones(5, device=utils.get_rank())
+    x = torch.ones(5, device=device)
+    print(x)
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError('Invalid gradient_accumulation_steps parameter: '
