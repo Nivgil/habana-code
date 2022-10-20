@@ -1072,10 +1072,10 @@ def main():
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
                         #  TODO(ngiladi): include data loading time
-                        # if utils.is_main_process():
-                        #     print(f'Rank {utils.get_rank()} STEP'
-                        #           f' {global_step} compute logs '
-                        #           f'{compute_state.layer_sample_size}')
+                        if utils.is_main_process():
+                            print(f'Rank {utils.get_rank()} STEP'
+                                  f' {global_step} compute logs '
+                                  f'{compute_state.layer_sample_size}')
                         compute_state.reset_state(
                             compute_threshold=args.compute_threshold,
                             enable_drop=(global_step > 5 and (
