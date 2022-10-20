@@ -7,8 +7,8 @@
 BERT Pretraining script
 export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
-export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
-#export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
+#export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
+export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
 mpirun -n 4 --bind-to core --map-by socket:PE=4 --rank-by core --report-bindings --allow-run-as-root \
 python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp \
       --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
@@ -461,7 +461,7 @@ def update_tensors(grad_tensors, outputs):
 
 def setup_training(args):
     if args.use_habana:
-        device = torch.device("hpu")
+        device = torch.device('hpu')
 
         if args.hmp:
             print(args.hmp_bf16)
@@ -520,9 +520,12 @@ def setup_training(args):
     else:
         dllogger.init(backends=[])
 
-    print(f'Rank: {utils.get_rank()} online.\tn_pu: {args.n_pu}, '
+    print(f'Rank: {utils.get_rank()} online.\t world size: '
+          f'{utils.get_world_size()},\t n_pu: {args.n_pu},\t device: {device}, '
           f'distributed training: {bool(args.local_rank != -1)}, '
           f'16-bits training: {args.fp16 or args.hmp}')
+
+    x = torch.ones(5, device=utils.get_rank())
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError('Invalid gradient_accumulation_steps parameter: '
