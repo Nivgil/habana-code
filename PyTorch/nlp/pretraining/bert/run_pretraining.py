@@ -23,7 +23,7 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp
 # For HPU
 python run_pretraining.py --do_train --bert_model=bert-large-uncased \
     --hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt \
-    --use_lazy_mode=True --config_file=./bert_config.json \
+    --use_lazy_mode=False --config_file=./bert_config.json \
     --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
     --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints \
     --use_fused_lamb --input_dir=${DATA_DIR} --train_batch_size=8192 \
@@ -31,6 +31,7 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased \
     --warmup_proportion=0.2843 --max_steps=7038 --num_steps_per_checkpoint=200 \
     --learning_rate=0.006 --gradient_accumulation_steps=128 \
     --enable_packed_data_mode True --disable_progress_bar --use_habana
+     --compute_threshold=-1
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -1059,6 +1060,9 @@ def main():
                                 scaled_loss.backward()
                         else:
                             loss.backward()
+                        print(f'DEBUG: mini batch ended '
+                              f'{time.time() - time_logs["fwd_start"]:3.3f}'
+                              f' [sec]')
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
