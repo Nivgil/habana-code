@@ -904,14 +904,14 @@ def main():
                     raise ComputeTimeout(module_name)
             return log_time
 
-        print(f'Rank {utils.get_rank()} registers hooks')
-        for name, module in model.named_modules():
-            if name.split('.')[-1].isdigit():
-                layer_number = int(name.split('.')[-1])
-                module.register_forward_hook(
-                    get_hook_func('_'.join([name, 'fwd']), layer_number))
-                module.register_backward_hook(
-                    get_hook_func('_'.join([name, 'bwd']), layer_number))
+        # print(f'Rank {utils.get_rank()} registers hooks')
+        # for name, module in model.named_modules():
+        #     if name.split('.')[-1].isdigit():
+        #         layer_number = int(name.split('.')[-1])
+        #         module.register_forward_hook(
+        #             get_hook_func('_'.join([name, 'fwd']), layer_number))
+        #         module.register_backward_hook(
+        #             get_hook_func('_'.join([name, 'bwd']), layer_number))
 
         starting_time = time.time()
         # loop infinitely over epochs, termination is handled via iteration
