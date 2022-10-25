@@ -9,6 +9,7 @@ export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
 #export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
 export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
+# For GPU
 mpirun -n 4 --bind-to core --map-by socket:PE=4 --rank-by core --report-bindings --allow-run-as-root \
 python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp \
       --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
@@ -19,6 +20,7 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp
       --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=32 \
       --enable_packed_data_mode False --compute_threshold=-1 --disable_progress_bar
 
+# For HPU
 python run_pretraining.py --do_train --bert_model=bert-large-uncased \
     --hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt \
     --use_lazy_mode=True --config_file=./bert_config.json \
@@ -496,7 +498,7 @@ def setup_training(args):
         args.allreduce_post_accumulation_fp16 = False
     else:
         torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
+        device = torch.device('cuda', args.local_rank)
         os.environ['LOCAL_RANK'] = os.environ['OMPI_COMM_WORLD_LOCAL_RANK']
         os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
         os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
