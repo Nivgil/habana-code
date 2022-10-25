@@ -1061,7 +1061,7 @@ def main():
                         else:
                             loss.backward()
                         print(f'DEBUG: mini batch ended '
-                              f'{time.time() - time_logs["fwd_start"]:3.3f}'
+                              f'{time.time() - time_logs["fwd_start"][-1]:3.3f}'
                               f' [sec]')
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
