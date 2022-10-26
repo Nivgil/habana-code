@@ -1056,9 +1056,6 @@ def main():
                                 scaled_loss.backward()
                         else:
                             loss.backward()
-                        print(f'DEBUG: mini batch ended '
-                              f'{time.time():3.3f}'
-                              f' [sec]')
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
