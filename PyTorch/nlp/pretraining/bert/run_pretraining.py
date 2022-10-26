@@ -22,16 +22,15 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp
 
 # For HPU
 python run_pretraining.py --do_train --bert_model=bert-large-uncased \
-    --hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt \
-    --use_lazy_mode=False --config_file=./bert_config.json \
-    --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
-    --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints \
-    --use_fused_lamb --input_dir=${DATA_DIR} --train_batch_size=8192 \
-    --max_seq_length=128 --max_predictions_per_seq=20 \
-    --warmup_proportion=0.2843 --max_steps=7038 --num_steps_per_checkpoint=200 \
-    --learning_rate=0.006 --gradient_accumulation_steps=128 \
-    --enable_packed_data_mode True --disable_progress_bar --use_habana
-     --compute_threshold=-1
+--hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt\
+--use_lazy_mode=False --config_file=./bert_config.json \
+--allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
+--json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints \
+--input_dir=${DATA_DIR} --train_batch_size=8192 --max_seq_length=128 \
+--max_predictions_per_seq=20 --warmup_proportion=0.2843 --max_steps=7038 \
+--num_steps_per_checkpoint=20000 --learning_rate=0.006 \
+--gradient_accumulation_steps=128 --enable_packed_data_mode False \
+--disable_progress_bar --use_habana
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -528,9 +527,6 @@ def setup_training(args):
           f'distributed training: {bool(args.local_rank != -1)}, '
           f'16-bits training: {args.fp16 or args.hmp}')
 
-    x = torch.ones(5, device=device)
-    print(x)
-
     if args.gradient_accumulation_steps < 1:
         raise ValueError('Invalid gradient_accumulation_steps parameter: '
                          f'{args.gradient_accumulation_steps}, should be >= 1')
@@ -916,7 +912,7 @@ def main():
         starting_time = time.time()
         # loop infinitely over epochs, termination is handled via iteration
         # count
-        time_logs = collections.defaultdict(list)
+        # time_logs = collections.defaultdict(list)
         while True:
             thread = None
             restored_data_loader = None
@@ -1001,7 +997,7 @@ def main():
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
-                time_logs['fwd_start'].append(time.time())
+                # time_logs['fwd_start'].append(time.time())
                 for step, batch in enumerate(train_iter):  # delayed update loop
                     training_steps += 1
 
@@ -1050,7 +1046,7 @@ def main():
                                 # this division was merged into predivision
                                 loss = loss / args.gradient_accumulation_steps
                                 divisor = 1.0
-                        time_logs['bwd_start'].append(time.time())
+                        # time_logs['bwd_start'].append(time.time())
                         if args.fp16:
                             with amp.scale_loss(
                                     loss,
@@ -1061,7 +1057,7 @@ def main():
                         else:
                             loss.backward()
                         print(f'DEBUG: mini batch ended '
-                              f'{time.time() - time_logs["fwd_start"][-1]:3.3f}'
+                              f'{time.time():3.3f}'
                               f' [sec]')
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
@@ -1071,7 +1067,7 @@ def main():
                         htcore.mark_step()
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    time_logs['bwd_end'].append(time.time())
+                    # time_logs['bwd_end'].append(time.time())
 
                     loss_list.append(loss)
 
@@ -1195,13 +1191,13 @@ def main():
                         # Exiting the training due to hitting max steps, or being sent a
                         # timeout from the cluster scheduler
                         if global_step >= args.steps_this_run or timeout_sent:
-                            with open(f'compute_logs_{utils.get_rank()}.csv',
-                                      'w') as file:
-                                file.write(pd.DataFrame(time_logs).to_csv())
+                            # with open(f'compute_logs_{utils.get_rank()}.csv',
+                            #           'w') as file:
+                            #     file.write(pd.DataFrame(time_logs).to_csv())
                             del train_dataloader
                             # thread.join()
                             return args, final_loss, train_time_raw, global_step
-                    time_logs['fwd_start'].append(time.time())
+                    # time_logs['fwd_start'].append(time.time())
                 del train_dataloader
                 # thread.join()
                 # Make sure pool has finished and switch train_dataloader
