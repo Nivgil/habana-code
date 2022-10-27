@@ -22,7 +22,7 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp
 
 # For HPU
 python run_pretraining.py --do_train --bert_model=bert-large-uncased \
---hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt\
+--hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt \
 --use_lazy_mode=False --config_file=./bert_config.json \
 --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
 --json-summary=runs/logs/dllogger.json --output_dir=runs/checkpoints \
@@ -892,22 +892,22 @@ def main():
             def log_time(*args):
                 current_time_passed = (
                         time.time() - compute_state.start_compute)
-                if 'bwd' in module_name:
-                    compute_state.layer_sample_size[layer_index] += (
-                        compute_state.mini_batch_size)
+                # if 'bwd' in module_name:
+                #     compute_state.layer_sample_size[layer_index] += (
+                #         compute_state.mini_batch_size)
                 if compute_state.enable_drop and (
                         current_time_passed >= compute_state.threshold):
                     raise ComputeTimeout(module_name)
             return log_time
 
-        # print(f'Rank {utils.get_rank()} registers hooks')
-        # for name, module in model.named_modules():
-        #     if name.split('.')[-1].isdigit():
-        #         layer_number = int(name.split('.')[-1])
-        #         module.register_forward_hook(
-        #             get_hook_func('_'.join([name, 'fwd']), layer_number))
-        #         module.register_backward_hook(
-        #             get_hook_func('_'.join([name, 'bwd']), layer_number))
+        print(f'Rank {utils.get_rank()} registers hooks')
+        for name, module in model.named_modules():
+            if name.split('.')[-1].isdigit():
+                layer_number = int(name.split('.')[-1])
+                module.register_forward_hook(
+                    get_hook_func('_'.join([name, 'fwd']), layer_number))
+                # module.register_backward_hook(
+                #     get_hook_func('_'.join([name, 'bwd']), layer_number))
 
         starting_time = time.time()
         # loop infinitely over epochs, termination is handled via iteration
@@ -1056,6 +1056,8 @@ def main():
                                 scaled_loss.backward()
                         else:
                             loss.backward()
+                        compute_state.layer_sample_size += (
+                            compute_state.mini_batch_size)
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
