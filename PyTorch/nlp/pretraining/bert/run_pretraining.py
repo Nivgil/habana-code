@@ -843,6 +843,10 @@ def main():
     device, args = setup_training(args)
 
     if args.use_habana:
+        try:
+            import habana_frameworks.torch as ht
+        except ImportError:
+            assert False, "Could not import habana_frameworks.torch"
         if args.use_lazy_mode:
             try:
                 import habana_frameworks.torch.core as htcore
@@ -900,19 +904,20 @@ def main():
                     raise ComputeTimeout(module_name)
             return log_time
 
-        print(f'Rank {utils.get_rank()} registers hooks')
-        for name, module in model.named_modules():
-            if name.split('.')[-1].isdigit():
-                layer_number = int(name.split('.')[-1])
-                module.register_forward_hook(
-                    get_hook_func('_'.join([name, 'fwd']), layer_number))
-                # module.register_backward_hook(
-                #     get_hook_func('_'.join([name, 'bwd']), layer_number))
+        # TODO - move this into a function, toggle hook registration with flag
+        # print(f'Rank {utils.get_rank()} registers hooks')
+        # for name, module in model.named_modules():
+        #     if name.split('.')[-1].isdigit():
+        #         layer_number = int(name.split('.')[-1])
+        #         module.register_forward_hook(
+        #             get_hook_func('_'.join([name, 'fwd']), layer_number))
+        #         # module.register_backward_hook(
+        #         #     get_hook_func('_'.join([name, 'bwd']), layer_number))
 
         starting_time = time.time()
         # loop infinitely over epochs, termination is handled via iteration
         # count
-        # time_logs = collections.defaultdict(list)
+        time_logs = collections.defaultdict(list)
         while True:
             thread = None
             restored_data_loader = None
@@ -997,7 +1002,8 @@ def main():
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
-                # time_logs['fwd_start'].append(time.time())
+                ht.hpu.synchronize()
+                time_logs['batch_start'].append(time.time())
                 for step, batch in enumerate(train_iter):  # delayed update loop
                     training_steps += 1
 
@@ -1009,7 +1015,8 @@ def main():
 
                     # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                     #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
-
+                    ht.hpu.synchronize()
+                    time_logs['fwd_start'].append(time.time())
                     try:
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
@@ -1045,8 +1052,6 @@ def main():
                             if not args.allreduce_post_accumulation:
                                 # this division was merged into predivision
                                 loss = loss / args.gradient_accumulation_steps
-                                divisor = 1.0
-                        # time_logs['bwd_start'].append(time.time())
                         if args.fp16:
                             with amp.scale_loss(
                                     loss,
@@ -1063,19 +1068,23 @@ def main():
                         # TODO(ngiladi): correct divisor and loss value
 
                     if args.use_lazy_mode and args.use_habana:
-                        htcore.mark_step()
+                        htcore.mark_step()  # is this a blocking call? NO. need to read the value
+                        ht.hpu.synchronize()     # this is a blocking call
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    # time_logs['bwd_end'].append(time.time())
+                    time_logs['bwd_end'].append(time.time())
 
                     loss_list.append(loss)
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
+                        time_logs['allreduce_start'].append(time.time())
                         if torch.distributed.is_initialized():
                             torch.distributed.all_reduce(compute_state.layer_sample_size)
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
+                        ht.hpu.synchronize()
+                        time_logs['allreduce_end'].append(time.time())
                         #  TODO(ngiladi): include data loading time
                         if utils.is_main_process():
                             print(f'Rank {utils.get_rank()} STEP'
@@ -1190,9 +1199,9 @@ def main():
                         # Exiting the training due to hitting max steps, or being sent a
                         # timeout from the cluster scheduler
                         if global_step >= args.steps_this_run or timeout_sent:
-                            # with open(f'compute_logs_{utils.get_rank()}.csv',
-                            #           'w') as file:
-                            #     file.write(pd.DataFrame(time_logs).to_csv())
+                            with open(f'compute_logs_{utils.get_rank()}.json',
+                                       'w') as file:
+                                 file.write(json.dumps(time_logs))
                             del train_dataloader
                             # thread.join()
                             return args, final_loss, train_time_raw, global_step
