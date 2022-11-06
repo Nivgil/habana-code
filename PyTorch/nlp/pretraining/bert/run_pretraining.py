@@ -31,6 +31,18 @@ python run_pretraining.py --do_train --bert_model=bert-large-uncased \
 --num_steps_per_checkpoint=20000 --learning_rate=0.006 \
 --gradient_accumulation_steps=128 --enable_packed_data_mode False \
 --disable_progress_bar --use_habana
+
+python run_pretraining.py --do_train --bert_model=bert-large-uncased \
+      --config_file=./bert_config.json --use_habana \
+      --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
+      --json-summary=/tmp/log_directory/dllogger.json \
+      --output_dir=/tmp/results/checkpoints --use_fused_lamb \
+      --input_dir=${DATA_DIR} --train_batch_size=4096 --max_seq_length=512 \
+      --max_predictions_per_seq=80 --max_steps=1563 --warmup_proportion=0.128 \
+      --num_steps_per_checkpoint=200 --learning_rate=0.004 \
+      --gradient_accumulation_steps=512 \
+      --resume_from_checkpoint --phase1_end_step=7038 --phase2 \
+      --enable_packed_data_mode False
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -229,14 +241,14 @@ class ComputeTimeout(Exception):
 
 @dataclasses.dataclass
 class ComputeState:
-    layer_sample_size: torch.Tensor
+    computed_batch_size: torch.Tensor
     start_compute: float = 0
     threshold: float = 0
     enable_drop: bool = False
     mini_batch_size: int = 0
 
-    def __init__(self, layers_number: int, device: Union[int, torch.device]):
-        self.layer_sample_size = torch.zeros(layers_number, device=device)
+    def __init__(self, device: Union[int, torch.device]):
+        self.computed_batch_size = torch.zeros(1, device=device)
 
     def reset_state(self, compute_threshold: float, enable_drop: bool,
                     start_compute: float, mini_natch_size: int):
@@ -244,7 +256,7 @@ class ComputeState:
         self.enable_drop = enable_drop
         self.start_compute = start_compute
         self.mini_batch_size = mini_natch_size
-        self.layer_sample_size.zero_()
+        self.computed_batch_size.zero_()
 
 
 def parse_arguments():
@@ -835,7 +847,7 @@ def main():
     if args.enable_packed_data_mode:
         avg_seq_per_pack = read_avg_seq_per_sample(args.input_dir,
                                                    args.max_seq_length)
-    else:
+    elif args.local_rank <= 0:
         warnings.warn('--enable_packed_data_mode flag will be deprecated and '
                       'usage of packed and unpacked dataset will be decided '
                       'based on metadata file availability at input_dir')
@@ -890,19 +902,19 @@ def main():
             if name.split('.')[-1].isdigit():
                 layers_number += 1
 
-        compute_state = ComputeState(layers_number, device)
+        compute_state = ComputeState(device)
 
-        def get_hook_func(module_name: str, layer_index: int):
-            def log_time(*args):
-                current_time_passed = (
-                        time.time() - compute_state.start_compute)
-                # if 'bwd' in module_name:
-                #     compute_state.layer_sample_size[layer_index] += (
-                #         compute_state.mini_batch_size)
-                if compute_state.enable_drop and (
-                        current_time_passed >= compute_state.threshold):
-                    raise ComputeTimeout(module_name)
-            return log_time
+        # def get_hook_func(module_name: str, layer_index: int):
+        #     def log_time(*args):
+        #         current_time_passed = (
+        #                 time.time() - compute_state.start_compute)
+        #         # if 'bwd' in module_name:
+        #         #     compute_state.layer_sample_size[layer_index] += (
+        #         #         compute_state.mini_batch_size)
+        #         if compute_state.enable_drop and (
+        #                 current_time_passed >= compute_state.threshold):
+        #             raise ComputeTimeout(module_name)
+        #     return log_time
 
         # TODO - move this into a function, toggle hook registration with flag
         # print(f'Rank {utils.get_rank()} registers hooks')
@@ -1002,8 +1014,8 @@ def main():
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
-                ht.hpu.synchronize()
-                time_logs['batch_start'].append(time.time())
+                # ht.hpu.synchronize()
+                # time_logs['batch_start'].append(time.time())
                 for step, batch in enumerate(train_iter):  # delayed update loop
                     training_steps += 1
 
@@ -1015,9 +1027,18 @@ def main():
 
                     # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                     #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
-                    ht.hpu.synchronize()
+                    # ht.hpu.synchronize()
+                    time_logs['world_size'].append(utils.get_world_size())
+                    time_logs['batch'].append(input_mask.shape[0])
+                    time_logs['sentence_length'].append(input_mask.shape[1])
+                    time_logs['step'].append(
+                        training_steps % args.gradient_accumulation_steps)
                     time_logs['fwd_start'].append(time.time())
                     try:
+                        if compute_state.enable_drop and (
+                                time.time() - compute_state.start_compute >= (
+                                compute_state.threshold)):
+                            raise ComputeTimeout(step)
                         if args.local_rank != -1 and not args.allreduce_post_accumulation \
                                     and (training_steps % args.gradient_accumulation_steps != 0):
                             with model.no_sync():
@@ -1061,7 +1082,7 @@ def main():
                                 scaled_loss.backward()
                         else:
                             loss.backward()
-                        compute_state.layer_sample_size += (
+                        compute_state.computed_batch_size += (
                             compute_state.mini_batch_size)
                     except ComputeTimeout as e:
                         print(f'Rank {utils.get_rank()} DROP at {e}')
@@ -1078,18 +1099,26 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
-                        time_logs['allreduce_start'].append(time.time())
+                        # time_logs['allreduce_start'].append(time.time())
                         if torch.distributed.is_initialized():
-                            torch.distributed.all_reduce(compute_state.layer_sample_size)
+                            torch.distributed.all_reduce(
+                                compute_state.computed_batch_size)
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
-                        ht.hpu.synchronize()
-                        time_logs['allreduce_end'].append(time.time())
+                        # ht.hpu.synchronize()
+                        # time_logs['allreduce_end'].append(time.time())
                         #  TODO(ngiladi): include data loading time
                         if utils.is_main_process():
                             print(f'Rank {utils.get_rank()} STEP'
                                   f' {global_step} compute logs '
-                                  f'{compute_state.layer_sample_size}')
+                                  f'{compute_state.computed_batch_size}')
+
+                    if args.use_lazy_mode and args.use_habana:
+                        htcore.mark_step()
+                    if training_steps % args.gradient_accumulation_steps == 0:
+                        time_logs['computed_batch'].append(
+                            compute_state.computed_batch_size.item())
+                        ht.hpu.synchronize()
                         compute_state.reset_state(
                             compute_threshold=args.compute_threshold,
                             enable_drop=(global_step > 5 and (
@@ -1097,9 +1126,10 @@ def main():
                             start_compute=time.time(),
                             mini_natch_size=len(input_ids)
                         )
+                    else:
+                        time_logs['computed_batch'].append(-1)
 
-                    if args.use_lazy_mode and args.use_habana:
-                            htcore.mark_step()
+                    time_logs['step_end'].append(time.time())
 
                     if global_step >= args.steps_this_run or timeout_sent or training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         for loss_t in loss_list:
@@ -1199,9 +1229,9 @@ def main():
                         # Exiting the training due to hitting max steps, or being sent a
                         # timeout from the cluster scheduler
                         if global_step >= args.steps_this_run or timeout_sent:
-                            with open(f'compute_logs_{utils.get_rank()}.json',
+                            with open(f'compute_logs_{utils.get_rank()}.csv',
                                        'w') as file:
-                                 file.write(json.dumps(time_logs))
+                                 file.write(pd.DataFrame(time_logs).to_csv())
                             del train_dataloader
                             # thread.join()
                             return args, final_loss, train_time_raw, global_step
