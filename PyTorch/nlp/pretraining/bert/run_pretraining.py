@@ -1037,6 +1037,8 @@ def main():
                             if compute_state.enable_drop and (
                                     current_time > compute_state.threshold):
                                 raise ComputeTimeout()
+                        else:
+                            time_logs['bwd_end'].append(-1)
 
                         training_steps += 1
 
