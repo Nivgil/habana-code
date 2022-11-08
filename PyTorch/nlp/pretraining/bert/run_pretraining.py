@@ -455,7 +455,7 @@ def parse_arguments():
                              ' units in seconds')
     parser.add_argument('--debug',
                         default=False,
-                        action='store_true',
+                        type=bool,
                         help='Debug mode. print more data related to drop'
                              ' compute. Might cause runtime overhead.')
 
@@ -942,7 +942,7 @@ def main():
     compute_state = ComputeState(device)
     starting_time = time.time()
     # loop infinitely over epochs, termination is handled via iteration count
-    time_logs = collections.defaultdict(list)
+    time_logs = []
     while True:
         restored_data_loader = None
         if not args.resume_from_checkpoint or epoch > 0 or (args.phase2 and global_step < 1) or args.init_checkpoint:
@@ -1041,13 +1041,11 @@ def main():
                     next_sentence_positions = None
                     positions = None
 
-                # time_logs['world_size'].append(utils.get_world_size())
-                # time_logs['batch'].append(input_mask.shape[0])
-                # time_logs['sentence_length'].append(input_mask.shape[1])
-                # time_logs['step'].append(local_step)
-                # time_logs['fwd_start'].append(time.time())
-
+                batch = input_mask.shape[0]
+                sentence_length = input_mask.shape[1]
                 if not drop_compute(wait_event, compute_state):
+                    fwd_start = time.time()
+                    compute_dropped = False
                     # Forward pass
                     if args.local_rank != -1 and not is_optimizer_step and (
                             not args.allreduce_post_accumulation):
@@ -1096,9 +1094,11 @@ def main():
                     compute_state.computed_batch_size += (
                         compute_state.mini_batch_size)
                 else:
+                    fwd_start = time.time()
+                    compute_dropped = True
                     if args.debug:
                         print(f'Rank {utils.get_rank()} dropped '
-                              f'{local_step + 1}/'
+                              f'{local_step}/'
                               f'{args.gradient_accumulation_steps}')
                 # End Compute
 
@@ -1110,7 +1110,7 @@ def main():
                     torch.cuda.synchronize()
 
                 loss_list.append(loss)
-
+                computed_batch = compute_state.computed_batch_size.item()
                 if is_optimizer_step:
                     lr_scheduler.step()  # learning rate warmup
                     if torch.distributed.is_initialized():
@@ -1124,9 +1124,7 @@ def main():
                               f'{compute_state.computed_batch_size}')
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
-
-                    # time_logs['computed_batch'].append(
-                    #     compute_state.computed_batch_size.item())
+                    computed_batch = compute_state.computed_batch_size.item()
                     wait_event.synchronize()
                     wait_event = None
                     compute_state.reset_state(
@@ -1136,8 +1134,17 @@ def main():
                         start_compute=time.time(),
                         mini_batch_size=len(input_ids)
                     )
-
-                # time_logs['step_end'].append(time.time())
+                step_end = time.time()
+                if global_step > 5:
+                    time_logs.append((global_step,
+                                      local_step,
+                                      utils.get_world_size(),
+                                      batch,
+                                      sentence_length,
+                                      computed_batch,
+                                      compute_dropped,
+                                      fwd_start,
+                                      step_end))
 
                 if global_step >= args.steps_this_run or timeout_sent or training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                     for loss_t in loss_list:
@@ -1238,7 +1245,17 @@ def main():
                     if global_step >= args.steps_this_run or timeout_sent:
                         with open(f'compute_logs_{utils.get_rank()}.csv',
                                    'w') as file:
-                             file.write(pd.DataFrame(time_logs).to_csv())
+                             file.write(pd.DataFrame(time_logs, columns=(
+                                 'global_step',
+                                 'local_step',
+                                 'world_size',
+                                 'batch',
+                                 'sentence_length',
+                                 'computed_batch',
+                                 'compute_dropped',
+                                 'fwd_start',
+                                 'step_end'
+                             )).to_csv())
                         del train_dataloader
                         return args, final_loss, train_time_raw, global_step
             del train_dataloader
