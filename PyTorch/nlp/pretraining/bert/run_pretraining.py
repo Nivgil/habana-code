@@ -94,6 +94,12 @@ except ImportError:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
 
+try:
+    import habana_frameworks.torch as ht
+except ImportError:
+    assert False, "Could not import habana_frameworks.torch"
+
+
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
 
@@ -807,6 +813,11 @@ def get_metadata_file_path(input_dir: str) -> str:
     metadata_file_path = os.path.join(head_tail[0],metadata_file_name)
     return metadata_file_path
 
+def mark_event():
+    end_event = ht.hpu.Event(enable_timing=True)
+    end_event.record()
+    ht.hpu.current_stream().wait_event(end_event)
+    return end_event
 
 def read_avg_seq_per_sample(input_dir: str, max_sequence_length) -> float:
     metadata = None
@@ -1014,9 +1025,17 @@ def main():
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
-                # ht.hpu.synchronize()
                 # time_logs['batch_start'].append(time.time())
+                wait_event = None
                 for step, batch in enumerate(train_iter):  # delayed update loop
+
+                    if wait_event is None:
+                        batch_start_time = time.time()
+                    else:
+                        wait_event.synchronize()
+                        current_time = time.time() - batch_start_time
+                        #print(f'Rank {utils.get_rank()} current_time: {current_time}')
+
                     training_steps += 1
 
                     batch = [t.to(device) for t in batch]
@@ -1027,7 +1046,6 @@ def main():
 
                     # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
                     #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
-                    # ht.hpu.synchronize()
                     time_logs['world_size'].append(utils.get_world_size())
                     time_logs['batch'].append(input_mask.shape[0])
                     time_logs['sentence_length'].append(input_mask.shape[1])
@@ -1090,7 +1108,7 @@ def main():
 
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()  # is this a blocking call? NO. need to read the value
-                        ht.hpu.synchronize()     # this is a blocking call
+                        wait_event = mark_event()
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     time_logs['bwd_end'].append(time.time())
@@ -1105,7 +1123,6 @@ def main():
                                 compute_state.computed_batch_size)
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
-                        # ht.hpu.synchronize()
                         # time_logs['allreduce_end'].append(time.time())
                         #  TODO(ngiladi): include data loading time
                         if utils.is_main_process():
@@ -1118,7 +1135,8 @@ def main():
                     if training_steps % args.gradient_accumulation_steps == 0:
                         time_logs['computed_batch'].append(
                             compute_state.computed_batch_size.item())
-                        ht.hpu.synchronize()
+                        wait_event.synchronize()
+                        wait_event = None
                         compute_state.reset_state(
                             compute_threshold=args.compute_threshold,
                             enable_drop=(global_step > 5 and (
