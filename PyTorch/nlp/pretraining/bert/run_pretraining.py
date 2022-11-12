@@ -1028,31 +1028,33 @@ def main():
                 # time_logs['batch_start'].append(time.time())
                 wait_event = None
                 for step, batch in enumerate(train_iter):  # delayed update loop
-
-                    if wait_event is None:
-                        batch_start_time = time.time()
-                    else:
-                        wait_event.synchronize()
-                        current_time = time.time() - batch_start_time
-                        #print(f'Rank {utils.get_rank()} current_time: {current_time}')
-
-                    training_steps += 1
-
-                    batch = [t.to(device) for t in batch]
-                    if args.enable_packed_data_mode:
-                        input_ids, segment_ids, input_mask, positions, masked_lm_labels, next_sentence_positions, next_sentence_labels = batch
-                    else:
-                        input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-
-                    # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
-                    #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
-                    time_logs['world_size'].append(utils.get_world_size())
-                    time_logs['batch'].append(input_mask.shape[0])
-                    time_logs['sentence_length'].append(input_mask.shape[1])
-                    time_logs['step'].append(
-                        training_steps % args.gradient_accumulation_steps)
-                    time_logs['fwd_start'].append(time.time())
                     try:
+                        if wait_event is not None:
+                            wait_event.synchronize()
+                            time_logs['bwd_end'].append(time.time())
+                            current_time = (
+                                    time.time() - compute_state.start_compute)
+                            if compute_state.enable_drop and (
+                                    current_time > compute_state.threshold):
+                                raise ComputeTimeout()
+
+                        training_steps += 1
+
+                        batch = [t.to(device) for t in batch]
+                        if args.enable_packed_data_mode:
+                            input_ids, segment_ids, input_mask, positions, masked_lm_labels, next_sentence_positions, next_sentence_labels = batch
+                        else:
+                            input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+
+                        # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
+                        #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
+                        time_logs['world_size'].append(utils.get_world_size())
+                        time_logs['batch'].append(input_mask.shape[0])
+                        time_logs['sentence_length'].append(input_mask.shape[1])
+                        time_logs['step'].append(
+                            training_steps % args.gradient_accumulation_steps)
+                        time_logs['fwd_start'].append(time.time())
+
                         if compute_state.enable_drop and (
                                 time.time() - compute_state.start_compute >= (
                                 compute_state.threshold)):
@@ -1103,7 +1105,8 @@ def main():
                         compute_state.computed_batch_size += (
                             compute_state.mini_batch_size)
                     except ComputeTimeout as e:
-                        print(f'Rank {utils.get_rank()} DROP at {e}')
+                        pass
+                        # print(f'Rank {utils.get_rank()} DROP at {e}')
                         # TODO(ngiladi): correct divisor and loss value
 
                     if args.use_lazy_mode and args.use_habana:
@@ -1111,7 +1114,6 @@ def main():
                         wait_event = mark_event()
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    time_logs['bwd_end'].append(time.time())
 
                     loss_list.append(loss)
 
