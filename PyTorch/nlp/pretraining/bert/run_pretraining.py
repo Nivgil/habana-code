@@ -63,7 +63,7 @@ import time
 
 import pandas as pd
 from tqdm import tqdm
-from typing import Union
+from typing import Union, Optional
 import json
 from concurrent.futures import ProcessPoolExecutor
 import random
@@ -261,11 +261,11 @@ class ComputeState:
         self.computed_batch_size = torch.zeros(1, device=device)
 
     def reset_state(self, compute_threshold: float, enable_drop: bool,
-                    start_compute: float, mini_natch_size: int):
+                    start_compute: float, mini_batch_size: int):
         self.threshold = compute_threshold
         self.enable_drop = enable_drop
         self.start_compute = start_compute
-        self.mini_batch_size = mini_natch_size
+        self.mini_batch_size = mini_batch_size
         self.computed_batch_size.zero_()
 
 
@@ -445,15 +445,19 @@ def parse_arguments():
                         help='Whether to run model in lazy or eager execution mode, default=True for lazy mode')
     parser.add_argument('--enable_packed_data_mode', default='True', type=lambda x: x.lower() == 'true',
                         help='enable/disable training with packed data. Default is True, --input_dir should be set accordingly')
-    parser.add_argument("--use_zero_optimizer",
+    parser.add_argument('--use_zero_optimizer',
                         default='False', type=lambda x: x.lower() == 'true',
                         help='use zero optimizer')
-
-    parser.add_argument("--compute_threshold",
+    parser.add_argument('--compute_threshold',
                         default=-1,
                         type=float,
-                        help="Stop FWD/BWD when the threshold is reached."
-                             " units in seconds")
+                        help='Stop FWD/BWD when the threshold is reached.'
+                             ' units in seconds')
+    parser.add_argument('--debug',
+                        default=False,
+                        action='store_true',
+                        help='Debug mode. print more data related to drop'
+                             ' compute. Might cause runtime overhead.')
 
     args = parser.parse_args()
     args.fp16 = args.fp16 or args.amp
@@ -818,11 +822,21 @@ def get_metadata_file_path(input_dir: str) -> str:
     return metadata_file_path
 
 
-def mark_event():
+def mark_event() -> ht.hpu.Event:
     end_event = ht.hpu.Event(enable_timing=True)
     end_event.record()
     ht.hpu.current_stream().wait_event(end_event)
     return end_event
+
+
+def drop_compute(wait_event: Optional[ht.hpu.Event],
+                 compute_state: ComputeState) -> bool:
+    if wait_event is not None:
+        wait_event.synchronize()
+    current_time = time.time() - compute_state.start_compute
+    if compute_state.enable_drop and (current_time > compute_state.threshold):
+        return True
+    return False
 
 
 def read_avg_seq_per_sample(input_dir: str, max_sequence_length) -> float:
@@ -887,398 +901,360 @@ def main():
     dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
 
     # Prepare optimizer
-    model, optimizer, lr_scheduler, checkpoint, global_step, criterion = prepare_model_and_optimizer(args, device)
+    (
+        model,
+        optimizer,
+        lr_scheduler,
+        checkpoint,
+        global_step,
+        criterion
+    ) = prepare_model_and_optimizer(args, device)
 
     if utils.is_main_process():
         dllogger.log(step="PARAMETER", data={"SEED": args.seed})
 
     raw_train_start = None
-    if args.do_train:
-        if utils.is_main_process():
-            dllogger.log(step='PARAMETER',
-                         data={'train_start': True})
-            dllogger.log(step='PARAMETER',
-                         data={'batch_size_per_pu': args.train_batch_size})
-            dllogger.log(step='PARAMETER',
-                         data={'learning_rate': args.learning_rate})
+    if not args.do_train:
+        if args.use_lazy_mode and args.use_habana:
+            os.environ.pop("PT_HPU_LAZY_MODE")
+        return
 
-        model.train()
-        most_recent_ckpts_paths = []
-        average_loss = 0.0  # averaged loss every args.log_freq steps
-        epoch = 0
-        training_steps = 0
-        average_training_time_per_step = 0
-        average_perf_per_step = 0
-        loss_list = []
+    if utils.is_main_process():
+        dllogger.log(step='PARAMETER',
+                     data={'train_start': True})
+        dllogger.log(step='PARAMETER',
+                     data={'batch_size_per_pu': args.train_batch_size})
+        dllogger.log(step='PARAMETER',
+                     data={'learning_rate': args.learning_rate})
 
-        if device.type == 'cuda':
-            pool = ProcessPoolExecutor(1)
+    model.train()
+    most_recent_ckpts_paths = []
+    average_loss = 0.0  # averaged loss every args.log_freq steps
+    epoch = 0
+    training_steps = 0
+    average_training_time_per_step = 0
+    average_perf_per_step = 0
+    loss_list = []
 
-        layers_number = 0
-        for name, module in model.named_modules():
-            if name.split('.')[-1].isdigit():
-                layers_number += 1
+    if device.type == 'cuda':
+        pool = ProcessPoolExecutor(1)
 
-        compute_state = ComputeState(device)
+    compute_state = ComputeState(device)
+    starting_time = time.time()
+    # loop infinitely over epochs, termination is handled via iteration count
+    time_logs = collections.defaultdict(list)
+    while True:
+        restored_data_loader = None
+        if not args.resume_from_checkpoint or epoch > 0 or (args.phase2 and global_step < 1) or args.init_checkpoint:
+            files = []
+            for file in os.listdir(args.input_dir):
+                if os.path.isfile(os.path.join(args.input_dir, file)):
+                    # Packed files have no 'training' pre/postfix.
+                    if args.enable_packed_data_mode or 'training' in file:
+                        files.append(os.path.join(args.input_dir, file))
+            files.sort()
+            num_files = len(files)
+            random.Random(args.seed + epoch).shuffle(files)
+            f_start_id = 0
+        else:
+            f_start_id = checkpoint['files'][0]
+            files = checkpoint['files'][1:]
+            args.resume_from_checkpoint = False
+            num_files = len(files)
+            # may not exist in all checkpoints
+            epoch = checkpoint.get('epoch', 0)
+            restored_data_loader = checkpoint.get('data_loader', None)
 
-        # def get_hook_func(module_name: str, layer_index: int):
-        #     def log_time(*args):
-        #         current_time_passed = (
-        #                 time.time() - compute_state.start_compute)
-        #         # if 'bwd' in module_name:
-        #         #     compute_state.layer_sample_size[layer_index] += (
-        #         #         compute_state.mini_batch_size)
-        #         if compute_state.enable_drop and (
-        #                 current_time_passed >= compute_state.threshold):
-        #             raise ComputeTimeout(module_name)
-        #     return log_time
+        shared_file_list = {}
 
-        # TODO - move this into a function, toggle hook registration with flag
-        # print(f'Rank {utils.get_rank()} registers hooks')
-        # for name, module in model.named_modules():
-        #     if name.split('.')[-1].isdigit():
-        #         layer_number = int(name.split('.')[-1])
-        #         module.register_forward_hook(
-        #             get_hook_func('_'.join([name, 'fwd']), layer_number))
-        #         # module.register_backward_hook(
-        #         #     get_hook_func('_'.join([name, 'bwd']), layer_number))
+        if torch.distributed.is_initialized() and (
+                utils.get_world_size() > num_files):
+            remainder = utils.get_world_size() % num_files
+            data_file = files[(f_start_id * utils.get_world_size() + utils.get_rank() + remainder * f_start_id) % num_files]
+        else:
+            data_file = files[(f_start_id * utils.get_world_size() + utils.get_rank()) % num_files]
 
-        starting_time = time.time()
-        # loop infinitely over epochs, termination is handled via iteration
-        # count
-        time_logs = collections.defaultdict(list)
-        while True:
-            thread = None
+        previous_file = data_file
+
+        if restored_data_loader is None:
+            num_workers = 0 if args.use_habana else 4
+            train_data = PretrainingDataset(data_file,
+                                            args.max_predictions_per_seq,
+                                            args.enable_packed_data_mode)
+            train_sampler = torch.utils.data.RandomSampler(train_data)
+            train_dataloader = torch.utils.data.DataLoader(
+                train_data, sampler=train_sampler,
+                batch_size=args.train_batch_size * args.n_pu,
+                num_workers=num_workers,
+                worker_init_fn=worker_init,
+                drop_last=True,
+                pin_memory=True
+            )
+            # shared_file_list["0"] = (train_dataloader, data_file)
+        else:
+            train_dataloader = restored_data_loader
             restored_data_loader = None
-            if not args.resume_from_checkpoint or epoch > 0 or (args.phase2 and global_step < 1) or args.init_checkpoint:
-                files = []
-                for file in os.listdir(args.input_dir):
-                    if os.path.isfile(os.path.join(args.input_dir, file)):
-                        # Packed files have no 'training' pre/postfix.
-                        if args.enable_packed_data_mode or 'training' in file:
-                            files.append(os.path.join(args.input_dir, file))
-                files.sort()
-                num_files = len(files)
-                random.Random(args.seed + epoch).shuffle(files)
-                f_start_id = 0
-            else:
-                f_start_id = checkpoint['files'][0]
-                files = checkpoint['files'][1:]
-                args.resume_from_checkpoint = False
-                num_files = len(files)
-                # may not exist in all checkpoints
-                epoch = checkpoint.get('epoch', 0)
-                restored_data_loader = checkpoint.get('data_loader', None)
 
-            shared_file_list = {}
+        overflow_buf = None
+        if args.allreduce_post_accumulation and not args.use_habana:
+            overflow_buf = torch.cuda.IntTensor([0])
 
-            if torch.distributed.is_initialized() and (
-                    utils.get_world_size() > num_files):
-                remainder = utils.get_world_size() % num_files
-                data_file = files[(f_start_id * utils.get_world_size() + utils.get_rank() + remainder * f_start_id) % num_files]
+        for f_id in range(f_start_id + 1, len(files)):
+
+            if utils.get_world_size() > num_files:
+                data_file = files[(f_id * utils.get_world_size() + utils.get_rank() + remainder * f_id) % num_files]
             else:
-                data_file = files[(f_start_id * utils.get_world_size() + utils.get_rank()) % num_files]
+                data_file = files[(f_id * utils.get_world_size() + utils.get_rank()) % num_files]
 
             previous_file = data_file
 
-            if restored_data_loader is None:
-                num_workers = 0 if args.use_habana else 4
-                train_data = PretrainingDataset(data_file,
-                                                args.max_predictions_per_seq,
-                                                args.enable_packed_data_mode)
-                train_sampler = torch.utils.data.RandomSampler(train_data)
-                train_dataloader = torch.utils.data.DataLoader(
-                    train_data, sampler=train_sampler,
-                    batch_size=args.train_batch_size * args.n_pu,
-                    num_workers=num_workers,
-                    worker_init_fn=worker_init,
-                    drop_last=True,
-                    pin_memory=True
-                )
-                # shared_file_list["0"] = (train_dataloader, data_file)
+            if device.type == 'cuda':
+                dataset_future = pool.submit(create_pretraining_dataset,
+                                             data_file,
+                                             args.max_predictions_per_seq,
+                                             shared_file_list,
+                                             args,
+                                             worker_init)
+
+            if utils.is_main_process():
+                train_iter = tqdm(
+                    train_dataloader,
+                    desc="Iteration",
+                    disable=args.disable_progress_bar)
             else:
-                train_dataloader = restored_data_loader
-                restored_data_loader = None
+                train_iter = train_dataloader
 
-            overflow_buf = None
-            if args.allreduce_post_accumulation and not args.use_habana:
-                overflow_buf = torch.cuda.IntTensor([0])
+            if raw_train_start is None:
+                raw_train_start = time.time()
+            wait_event = None
+            for batch in train_iter:  # delayed update loop
 
-            for f_id in range(f_start_id + 1, len(files)):
+                training_steps += 1
+                local_step = training_steps % args.gradient_accumulation_steps
+                is_optimizer_step = (local_step == 0)
 
-                if utils.get_world_size() > num_files:
-                    data_file = files[(f_id * utils.get_world_size() + utils.get_rank() + remainder * f_id) % num_files]
+                batch = [t.to(device) for t in batch]
+                if args.enable_packed_data_mode:
+                    input_ids, segment_ids, input_mask, positions, masked_lm_labels, next_sentence_positions, next_sentence_labels = batch
                 else:
-                    data_file = files[(f_id * utils.get_world_size() + utils.get_rank()) % num_files]
+                    input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                    next_sentence_positions = None
+                    positions = None
 
-                previous_file = data_file
+                # time_logs['world_size'].append(utils.get_world_size())
+                # time_logs['batch'].append(input_mask.shape[0])
+                # time_logs['sentence_length'].append(input_mask.shape[1])
+                # time_logs['step'].append(local_step)
+                # time_logs['fwd_start'].append(time.time())
 
-                if device.type == 'cuda':
-                    dataset_future = pool.submit(create_pretraining_dataset,
-                                                 data_file,
-                                                 args.max_predictions_per_seq,
-                                                 shared_file_list,
-                                                 args,
-                                                 worker_init)
-
-                if utils.is_main_process():
-                    train_iter = tqdm(
-                        train_dataloader,
-                        desc="Iteration",
-                        disable=args.disable_progress_bar)
-                else:
-                    train_iter = train_dataloader
-
-                if raw_train_start is None:
-                    raw_train_start = time.time()
-                # time_logs['batch_start'].append(time.time())
-                wait_event = None
-                for step, batch in enumerate(train_iter):  # delayed update loop
-                    try:
-                        if wait_event is not None:
-                            wait_event.synchronize()
-                        time_logs['bwd_end'].append(time.time())
-                        current_time = (
-                                time.time() - compute_state.start_compute)
-                        if compute_state.enable_drop and (
-                                current_time > compute_state.threshold):
-                            raise ComputeTimeout()
-
-                        training_steps += 1
-
-                        batch = [t.to(device) for t in batch]
-                        if args.enable_packed_data_mode:
-                            input_ids, segment_ids, input_mask, positions, masked_lm_labels, next_sentence_positions, next_sentence_labels = batch
-                        else:
-                            input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-
-                        # if (args.local_rank != -1) and (training_steps % args.gradient_accumulation_steps == 0):
-                        #     torch.distributed.barrier()  # TODO(ngiladi): why this is necessary?
-                        time_logs['world_size'].append(utils.get_world_size())
-                        time_logs['batch'].append(input_mask.shape[0])
-                        time_logs['sentence_length'].append(input_mask.shape[1])
-                        time_logs['step'].append(
-                            training_steps % args.gradient_accumulation_steps)
-                        time_logs['fwd_start'].append(time.time())
-
-                        if compute_state.enable_drop and (
-                                time.time() - compute_state.start_compute >= (
-                                compute_state.threshold)):
-                            raise ComputeTimeout(step)
-                        if args.local_rank != -1 and not args.allreduce_post_accumulation \
-                                    and (training_steps % args.gradient_accumulation_steps != 0):
-                            with model.no_sync():
-                                prediction_scores, seq_relationship_score = model(
-                                    input_ids=input_ids,
-                                    token_type_ids=segment_ids,
-                                    attention_mask=input_mask,
-                                    enable_packed_data_mode=args.enable_packed_data_mode,
-                                    positions=positions if args.enable_packed_data_mode else None,
-                                    next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None
-                                )
-                        else:
+                if not drop_compute(wait_event, compute_state):
+                    # Forward pass
+                    if args.local_rank != -1 and not is_optimizer_step and (
+                            not args.allreduce_post_accumulation):
+                        with model.no_sync():
                             prediction_scores, seq_relationship_score = model(
                                 input_ids=input_ids,
                                 token_type_ids=segment_ids,
                                 attention_mask=input_mask,
                                 enable_packed_data_mode=(
                                     args.enable_packed_data_mode),
-                                positions=positions if args.enable_packed_data_mode else None,
-                                next_sentence_positions=next_sentence_positions if args.enable_packed_data_mode else None
+                                positions=positions,
+                                next_sentence_positions=next_sentence_positions
                             )
+                    else:
+                        prediction_scores, seq_relationship_score = model(
+                            input_ids=input_ids,
+                            token_type_ids=segment_ids,
+                            attention_mask=input_mask,
+                            enable_packed_data_mode=(
+                                args.enable_packed_data_mode),
+                            positions=positions,
+                            next_sentence_positions=next_sentence_positions
+                        )
 
-                        loss = criterion(prediction_scores,
-                                         seq_relationship_score,
-                                         masked_lm_labels,
-                                         next_sentence_labels)
-                        if args.n_pu > 1:
-                            loss = loss.mean()  # mean() to average on multi-pu.
+                    loss = criterion(prediction_scores, seq_relationship_score,
+                                     masked_lm_labels, next_sentence_labels)
+                    if args.n_pu > 1:
+                        loss = loss.mean()  # mean() to average on multi-pu.
 
-                        divisor = args.gradient_accumulation_steps
-                        if args.gradient_accumulation_steps > 1:
-                            if not args.allreduce_post_accumulation:
-                                # this division was merged into predivision
-                                loss = loss / args.gradient_accumulation_steps
-                        if args.fp16:
-                            with amp.scale_loss(
-                                    loss,
-                                    optimizer,
-                                    delay_overflow_check=args.allreduce_post_accumulation
-                            ) as scaled_loss:
-                                scaled_loss.backward()
-                        else:
-                            loss.backward()
-                        compute_state.computed_batch_size += (
-                            compute_state.mini_batch_size)
-                    except ComputeTimeout as e:
-                        pass
-                        # print(f'Rank {utils.get_rank()} DROP at {e}')
-                        # TODO(ngiladi): correct divisor and loss value
+                    # Backward pass
+                    divisor = args.gradient_accumulation_steps
+                    if divisor > 1:
+                        if not args.allreduce_post_accumulation:
+                            # this division was merged into predivision
+                            loss = loss / divisor
+                    if args.fp16:
+                        with amp.scale_loss(
+                                loss,
+                                optimizer,
+                                delay_overflow_check=(
+                                        args.allreduce_post_accumulation)
+                        ) as scaled_loss:
+                            scaled_loss.backward()
+                    else:
+                        loss.backward()
+                    compute_state.computed_batch_size += (
+                        compute_state.mini_batch_size)
+                else:
+                    if args.debug:
+                        print(f'Rank {utils.get_rank()} dropped '
+                              f'{local_step + 1}/'
+                              f'{args.gradient_accumulation_steps}')
+                # End Compute
 
-                    if args.use_lazy_mode and args.use_habana:
-                        htcore.mark_step()  # is this a blocking call? NO. need to read the value
-                        wait_event = mark_event()
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                if args.use_lazy_mode and args.use_habana:
+                    htcore.mark_step()  # not a blocking step
+                    # TODO(ngiladi): maybe call before mark step?
+                    wait_event = mark_event()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
-                    loss_list.append(loss)
+                loss_list.append(loss)
 
-                    if training_steps % args.gradient_accumulation_steps == 0:
-                        lr_scheduler.step()  # learning rate warmup
-                        # time_logs['allreduce_start'].append(time.time())
-                        if torch.distributed.is_initialized():
-                            torch.distributed.all_reduce(
-                                compute_state.computed_batch_size)
-                        global_step = take_optimizer_step(
-                            args, optimizer, model, overflow_buf, global_step)
-                        # time_logs['allreduce_end'].append(time.time())
-                        if utils.is_main_process():
-                            print(f'Rank {utils.get_rank()} STEP'
-                                  f' {global_step} compute logs '
-                                  f'{compute_state.computed_batch_size}')
-
+                if is_optimizer_step:
+                    lr_scheduler.step()  # learning rate warmup
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(
+                            compute_state.computed_batch_size)
+                    global_step = take_optimizer_step(
+                        args, optimizer, model, overflow_buf, global_step)
+                    if utils.is_main_process():
+                        print(f'Rank {utils.get_rank()} STEP'
+                              f' {global_step} compute logs '
+                              f'{compute_state.computed_batch_size}')
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
-                    if training_steps % args.gradient_accumulation_steps == 0:
-                        time_logs['computed_batch'].append(
-                            compute_state.computed_batch_size.item())
-                        if global_step > 5:
-                            wait_event.synchronize()
-                        wait_event = None
-                        compute_state.reset_state(
-                            compute_threshold=args.compute_threshold,
-                            enable_drop=(global_step > 5 and (
-                                    compute_state.threshold > 0)),
-                            start_compute=time.time(),
-                            mini_natch_size=len(input_ids)
-                        )
-                    else:
-                        time_logs['computed_batch'].append(-1)
 
-                    time_logs['step_end'].append(time.time())
-
-                    if global_step >= args.steps_this_run or timeout_sent or training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
-                        for loss_t in loss_list:
-                            average_loss += loss_t.item()
-                        loss_list.clear()
-                        train_time = time.time() - starting_time
-                        starting_time = time.time()
-                        average_training_time_per_step = train_time/(args.gradient_accumulation_steps * args.log_freq)
-                        average_perf_per_step = args.train_batch_size*avg_seq_per_pack/average_training_time_per_step
-
-                    if global_step >= args.steps_this_run or timeout_sent:  # end of training
-                        train_time_raw = time.time() - raw_train_start
-                        last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
-                        last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
-                        average_loss = average_loss / (last_num_steps * divisor)
-                        average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
-                        if torch.distributed.is_initialized():
-                            average_loss /= utils.get_world_size()
-                            torch.distributed.barrier()  # TODO(ngiladi): not necessary
-                            torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
-                        final_loss = average_loss.item()
-                        #  TODO(ngiladi): improve logging format and wrap in a function
-                        if utils.is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={
-                                'final_loss':
-                                    f'{final_loss:3.4}',
-                                'average_training_time_step':
-                                    f'{average_training_time_per_step:3.4}',
-                                'average_perf_per_step':
-                                    f'{average_perf_per_step:3.4}'
-                            })
-                    elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
-                        if utils.is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={
-                                'average_loss':
-                                    f'{average_loss / (args.log_freq * divisor):3.4}',
-                                'step_loss':
-                                    f'{loss.item() * args.gradient_accumulation_steps / divisor:3.4}',
-                                'learning_rate':
-                                    f'{optimizer.param_groups[0]["lr"]:3.4}',
-                                'average_training_time_step':
-                                    f'{average_training_time_per_step:3.4}',
-                                'average_perf_per_step':
-                                    f'{average_perf_per_step:3.4}'
-                            })
-                        average_loss = 0
-
-                    if global_step >= args.steps_this_run or training_steps % (
-                            args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0 or timeout_sent:
-                        if isinstance(
-                                optimizer,
-                                torch.distributed.optim.ZeroRedundancyOptimizer
-                        ):
-                            optimizer.consolidate_state_dict()
-                        if utils.is_main_process() and not args.skip_checkpoint:
-                            # Save a trained model
-                            dllogger.log(step="PARAMETER", data={"checkpoint_step": global_step})
-                            model_to_save = model.module if hasattr(model,
-                                                                    'module') else model  # Only save the model it-self
-                            if args.resume_step < 0 or not args.phase2:
-                                output_save_file = os.path.join(
-                                    args.output_dir,
-                                    "ckpt_{}.pt".format(global_step)
-                                )
-                            else:
-                                output_save_file = os.path.join(
-                                    args.output_dir,
-                                    "ckpt_{}.pt".format(
-                                        global_step + args.phase1_end_step)
-                                )
-                            checkpoint_dict = {}
-                            if args.do_train:
-                                if args.use_habana or args.no_cuda:
-                                    checkpoint_dict = {
-                                        'model': model_to_save.state_dict(),
-                                        'optimizer': optimizer.state_dict(),
-                                        'files': [f_id] + files,
-                                        'epoch': epoch,
-                                        'data_loader': None if global_step >= args.max_steps else train_dataloader
-                                    }
-                                else:
-                                    checkpoint_dict = {
-                                        'model': model_to_save.state_dict(),
-                                        'optimizer': optimizer.state_dict(),
-                                        'master params':
-                                            list(amp.master_params(optimizer)),
-                                        'files': [f_id] + files,
-                                        'epoch': epoch,
-                                        'data_loader': None if global_step >= args.max_steps else train_dataloader}
-
-                                torch.save(checkpoint_dict, output_save_file)
-                                most_recent_ckpts_paths.append(output_save_file)
-                                if len(most_recent_ckpts_paths) > 3:
-                                    ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
-                                    os.remove(ckpt_to_be_removed)
-
-                        # Exiting the training due to hitting max steps, or being sent a
-                        # timeout from the cluster scheduler
-                        if global_step >= args.steps_this_run or timeout_sent:
-                            with open(f'compute_logs_{utils.get_rank()}.csv',
-                                       'w') as file:
-                                 file.write(pd.DataFrame(time_logs).to_csv())
-                            del train_dataloader
-                            # thread.join()
-                            return args, final_loss, train_time_raw, global_step
-                    # time_logs['fwd_start'].append(time.time())
-                del train_dataloader
-                # thread.join()
-                # Make sure pool has finished and switch train_dataloader
-                # NOTE: Will block until complete
-                if device.type == 'cuda':
-                    train_dataloader, data_file = dataset_future.result(timeout=None)
-                else:
-                    train_dataloader, data_file = create_pretraining_dataset(
-                        data_file,
-                        args.max_predictions_per_seq,
-                        shared_file_list,
-                        args,
-                        worker_init
+                    # time_logs['computed_batch'].append(
+                    #     compute_state.computed_batch_size.item())
+                    wait_event.synchronize()
+                    wait_event = None
+                    compute_state.reset_state(
+                        compute_threshold=args.compute_threshold,
+                        enable_drop=(global_step > 5 and (
+                                compute_state.threshold > 0)),
+                        start_compute=time.time(),
+                        mini_batch_size=len(input_ids)
                     )
-            epoch += 1
-    if args.use_lazy_mode and args.use_habana:
-        os.environ.pop("PT_HPU_LAZY_MODE")
+
+                # time_logs['step_end'].append(time.time())
+
+                if global_step >= args.steps_this_run or timeout_sent or training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
+                    for loss_t in loss_list:
+                        average_loss += loss_t.item()
+                    loss_list.clear()
+                    train_time = time.time() - starting_time
+                    starting_time = time.time()
+                    average_training_time_per_step = train_time/(args.gradient_accumulation_steps * args.log_freq)
+                    average_perf_per_step = args.train_batch_size*avg_seq_per_pack/average_training_time_per_step
+
+                if global_step >= args.steps_this_run or timeout_sent:  # end of training
+                    train_time_raw = time.time() - raw_train_start
+                    last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
+                    last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
+                    average_loss = average_loss / (last_num_steps * divisor)
+                    average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
+                    if torch.distributed.is_initialized():
+                        average_loss /= utils.get_world_size()
+                        torch.distributed.barrier()  # TODO(ngiladi): not necessary
+                        torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
+                    final_loss = average_loss.item()
+                    if utils.is_main_process():
+                        dllogger.log(step=(epoch, global_step, ), data={
+                            'final_loss':
+                                f'{final_loss:3.4}',
+                            'average_training_time_step':
+                                f'{average_training_time_per_step:3.4}',
+                            'average_perf_per_step':
+                                f'{average_perf_per_step:3.4}'
+                        })
+                elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
+                    if utils.is_main_process():
+                        dllogger.log(step=(epoch, global_step, ), data={
+                            'average_loss':
+                                f'{average_loss / (args.log_freq * divisor):3.4}',
+                            'step_loss':
+                                f'{loss.item() * args.gradient_accumulation_steps / divisor:3.4}',
+                            'learning_rate':
+                                f'{optimizer.param_groups[0]["lr"]:3.4}',
+                            'average_training_time_step':
+                                f'{average_training_time_per_step:3.4}',
+                            'average_perf_per_step':
+                                f'{average_perf_per_step:3.4}'
+                        })
+                    average_loss = 0
+
+                if global_step >= args.steps_this_run or training_steps % (
+                        args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0 or timeout_sent:
+                    if isinstance(
+                            optimizer,
+                            torch.distributed.optim.ZeroRedundancyOptimizer
+                    ):
+                        optimizer.consolidate_state_dict()
+                    if utils.is_main_process() and not args.skip_checkpoint:
+                        # Save a trained model
+                        dllogger.log(step="PARAMETER", data={"checkpoint_step": global_step})
+                        model_to_save = model.module if hasattr(model,
+                                                                'module') else model  # Only save the model it-self
+                        if args.resume_step < 0 or not args.phase2:
+                            output_save_file = os.path.join(
+                                args.output_dir,
+                                "ckpt_{}.pt".format(global_step)
+                            )
+                        else:
+                            output_save_file = os.path.join(
+                                args.output_dir,
+                                "ckpt_{}.pt".format(
+                                    global_step + args.phase1_end_step)
+                            )
+                        checkpoint_dict = {}
+                        if args.do_train:
+                            if args.use_habana or args.no_cuda:
+                                checkpoint_dict = {
+                                    'model': model_to_save.state_dict(),
+                                    'optimizer': optimizer.state_dict(),
+                                    'files': [f_id] + files,
+                                    'epoch': epoch,
+                                    'data_loader': None if global_step >= args.max_steps else train_dataloader
+                                }
+                            else:
+                                checkpoint_dict = {
+                                    'model': model_to_save.state_dict(),
+                                    'optimizer': optimizer.state_dict(),
+                                    'master params':
+                                        list(amp.master_params(optimizer)),
+                                    'files': [f_id] + files,
+                                    'epoch': epoch,
+                                    'data_loader': None if global_step >= args.max_steps else train_dataloader}
+
+                            torch.save(checkpoint_dict, output_save_file)
+                            most_recent_ckpts_paths.append(output_save_file)
+                            if len(most_recent_ckpts_paths) > 3:
+                                ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
+                                os.remove(ckpt_to_be_removed)
+
+                    # Exiting the training due to hitting max steps, or being sent a
+                    # timeout from the cluster scheduler
+                    if global_step >= args.steps_this_run or timeout_sent:
+                        with open(f'compute_logs_{utils.get_rank()}.csv',
+                                   'w') as file:
+                             file.write(pd.DataFrame(time_logs).to_csv())
+                        del train_dataloader
+                        return args, final_loss, train_time_raw, global_step
+            del train_dataloader
+            # Make sure pool has finished and switch train_dataloader
+            # NOTE: Will block until complete
+            if device.type == 'cuda':
+                train_dataloader, data_file = dataset_future.result(timeout=None)
+            else:
+                train_dataloader, data_file = create_pretraining_dataset(
+                    data_file,
+                    args.max_predictions_per_seq,
+                    shared_file_list,
+                    args,
+                    worker_init
+                )
+        epoch += 1
 
 
 if __name__ == "__main__":
