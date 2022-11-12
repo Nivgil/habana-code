@@ -82,6 +82,7 @@ import schedulers
 import lamb
 
 import utils
+from compute_timer import DeviceTimer
 
 try:
     import apex
@@ -826,18 +827,12 @@ def get_metadata_file_path(input_dir: str) -> str:
     return metadata_file_path
 
 
-def mark_event() -> ht.hpu.Event:
-    end_event = ht.hpu.Event(enable_timing=True)
-    end_event.record()
-    ht.hpu.current_stream().wait_event(end_event)
-    return end_event
-
-
-def drop_compute(wait_event: Optional[ht.hpu.Event],
+def drop_compute(timer : DeviceTimer,
                  compute_state: ComputeState) -> bool:
-    if wait_event is not None:
-        wait_event.synchronize()
-    current_time = time.time() - compute_state.start_compute
+    if not timer.is_started():
+        return False
+
+    current_time = timer.elapsed()
     if compute_state.enable_drop and (current_time > compute_state.threshold):
         return True
     return False
@@ -945,6 +940,7 @@ def main():
 
     compute_state = ComputeState(device)
     starting_time = time.time()
+    drop_timer = DeviceTimer(use_hpu = True)
     # loop infinitely over epochs, termination is handled via iteration count
     time_logs = []
     while True:
@@ -1030,7 +1026,6 @@ def main():
 
             if raw_train_start is None:
                 raw_train_start = time.time()
-            wait_event = None
             for batch in train_iter:  # delayed update loop
 
                 training_steps += 1
@@ -1047,7 +1042,7 @@ def main():
 
                 batch = input_mask.shape[0]
                 sentence_length = input_mask.shape[1]
-                if not drop_compute(wait_event, compute_state):
+                if not drop_compute(drop_timer, compute_state):
                     fwd_start = time.time()
                     compute_dropped = False
                     # Forward pass
@@ -1108,8 +1103,6 @@ def main():
 
                 if args.use_lazy_mode and args.use_habana:
                     htcore.mark_step()  # not a blocking step
-                    # TODO(ngiladi): maybe call before mark step?
-                    wait_event = mark_event()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
 
@@ -1127,8 +1120,8 @@ def main():
                               f'{compute_state.computed_batch_size}')
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
-                    wait_event.synchronize()
-                    wait_event = None
+                    drop_timer.reset()
+                    drop_timer.start()
                     compute_state.reset_state(
                         compute_threshold=args.compute_threshold,
                         enable_drop=(global_step > 5 and (
