@@ -7,8 +7,12 @@
 BERT Pretraining script
 export MASTER_ADDR="localhost"
 export MASTER_PORT="12345"
-#export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
+# packed data phase 1
+export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
+# non-packed data phase 1
 export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
+# non-packed data phase 2
+export DATA_DIR="/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_512_max_pred_80_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus"
 # For GPU
 mpirun -n 4 --bind-to core --map-by socket:PE=4 --rank-by core --report-bindings --allow-run-as-root \
 python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp \
@@ -813,11 +817,13 @@ def get_metadata_file_path(input_dir: str) -> str:
     metadata_file_path = os.path.join(head_tail[0],metadata_file_name)
     return metadata_file_path
 
+
 def mark_event():
     end_event = ht.hpu.Event(enable_timing=True)
     end_event.record()
     ht.hpu.current_stream().wait_event(end_event)
     return end_event
+
 
 def read_avg_seq_per_sample(input_dir: str, max_sequence_length) -> float:
     metadata = None
@@ -1031,14 +1037,12 @@ def main():
                     try:
                         if wait_event is not None:
                             wait_event.synchronize()
-                            time_logs['bwd_end'].append(time.time())
-                            current_time = (
-                                    time.time() - compute_state.start_compute)
-                            if compute_state.enable_drop and (
-                                    current_time > compute_state.threshold):
-                                raise ComputeTimeout()
-                        else:
-                            time_logs['bwd_end'].append(-1)
+                        time_logs['bwd_end'].append(time.time())
+                        current_time = (
+                                time.time() - compute_state.start_compute)
+                        if compute_state.enable_drop and (
+                                current_time > compute_state.threshold):
+                            raise ComputeTimeout()
 
                         training_steps += 1
 
@@ -1128,7 +1132,6 @@ def main():
                         global_step = take_optimizer_step(
                             args, optimizer, model, overflow_buf, global_step)
                         # time_logs['allreduce_end'].append(time.time())
-                        #  TODO(ngiladi): include data loading time
                         if utils.is_main_process():
                             print(f'Rank {utils.get_rank()} STEP'
                                   f' {global_step} compute logs '
@@ -1139,7 +1142,8 @@ def main():
                     if training_steps % args.gradient_accumulation_steps == 0:
                         time_logs['computed_batch'].append(
                             compute_state.computed_batch_size.item())
-                        wait_event.synchronize()
+                        if global_step > 5:
+                            wait_event.synchronize()
                         wait_event = None
                         compute_state.reset_state(
                             compute_threshold=args.compute_threshold,
