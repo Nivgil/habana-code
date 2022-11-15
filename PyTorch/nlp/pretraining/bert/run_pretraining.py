@@ -1114,7 +1114,6 @@ def main():
                     torch.cuda.synchronize()
 
                 loss_list.append(loss)
-                computed_batch = compute_state.computed_batch_size.item()
                 if is_optimizer_step:
                     lr_scheduler.step()  # learning rate warmup
                     if torch.distributed.is_initialized():
@@ -1128,7 +1127,6 @@ def main():
                               f'{compute_state.computed_batch_size}')
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
-                    computed_batch = compute_state.computed_batch_size.item()
                     wait_event.synchronize()
                     wait_event = None
                     compute_state.reset_state(
@@ -1145,7 +1143,7 @@ def main():
                                       utils.get_world_size(),
                                       batch,
                                       sentence_length,
-                                      computed_batch,
+                                      compute_state.computed_batch_size.item(),
                                       compute_dropped,
                                       fwd_start,
                                       step_end))
