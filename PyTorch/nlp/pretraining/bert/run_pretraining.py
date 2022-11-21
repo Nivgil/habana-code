@@ -458,8 +458,7 @@ def parse_arguments():
                         help='Stop FWD/BWD when the threshold is reached.'
                              ' units in seconds')
     parser.add_argument('--debug',
-                        default=False,
-                        type=bool,
+                        action='store_true',
                         help='Debug mode. print more data related to drop'
                              ' compute. Might cause runtime overhead.')
 
@@ -1048,7 +1047,10 @@ def main():
                 batch = input_mask.shape[0]
                 sentence_length = input_mask.shape[1]
                 if not drop_compute(wait_event, compute_state):
-                    fwd_start = time.time()
+                    if local_step == 1:
+                        fwd_start = compute_state.start_compute
+                    else:
+                        fwd_start = time.time()
                     compute_dropped = False
                     # Forward pass
                     if args.local_rank != -1 and not is_optimizer_step and (
@@ -1108,21 +1110,21 @@ def main():
 
                 if args.use_lazy_mode and args.use_habana:
                     htcore.mark_step()  # not a blocking step
-                    # TODO(ngiladi): maybe call before mark step?
                     wait_event = mark_event()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
 
                 loss_list.append(loss)
-                computed_batch = compute_state.computed_batch_size.item()
                 if is_optimizer_step:
+                    wait_event.synchronize()
+                    step_end = time.time()
                     lr_scheduler.step()  # learning rate warmup
                     if torch.distributed.is_initialized():
                         torch.distributed.all_reduce(
                             compute_state.computed_batch_size)
                     global_step = take_optimizer_step(
                         args, optimizer, model, overflow_buf, global_step)
-                    if utils.is_main_process():
+                    if utils.is_main_process() and args.debug:
                         print(f'Rank {utils.get_rank()} STEP'
                               f' {global_step} compute logs '
                               f'{compute_state.computed_batch_size}')
@@ -1138,7 +1140,11 @@ def main():
                         start_compute=time.time(),
                         mini_batch_size=len(input_ids)
                     )
-                step_end = time.time()
+                    if global_step == 6:
+                        start_train_timestamp = time.time()
+                else:
+                    computed_batch = compute_state.computed_batch_size.item()
+                    step_end = time.time()
                 if global_step > 5:
                     time_logs.append((global_step,
                                       local_step,
@@ -1149,7 +1155,6 @@ def main():
                                       compute_dropped,
                                       fwd_start,
                                       step_end))
-
                 if global_step >= args.steps_this_run or timeout_sent or training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                     for loss_t in loss_list:
                         average_loss += loss_t.item()
@@ -1170,6 +1175,7 @@ def main():
                         torch.distributed.barrier()  # TODO(ngiladi): not necessary
                         torch.distributed.all_reduce(average_loss)  # TODO(ngiladi): why necessary?
                     final_loss = average_loss.item()
+                    net_train_time = time.time() - start_train_timestamp
                     if utils.is_main_process():
                         dllogger.log(step=(epoch, global_step, ), data={
                             'final_loss':
@@ -1177,7 +1183,9 @@ def main():
                             'average_training_time_step':
                                 f'{average_training_time_per_step:3.4}',
                             'average_perf_per_step':
-                                f'{average_perf_per_step:3.4}'
+                                f'{average_perf_per_step:3.4}',
+                            'train_time_net':
+                                f'{net_train_time:3.4f}'
                         })
                 elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                     if utils.is_main_process():
