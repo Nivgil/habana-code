@@ -14,8 +14,9 @@ class DeviceTimer(object):
             import habana_frameworks.torch as ht
             self.habana_module = ht
 
-    def __init__(self, use_hpu=False, event_sync_delay=9):
+    def __init__(self, use_hpu=False, debug=False, event_sync_delay=9):
         self.start_time = None
+        self.debug = debug
         self.events = deque(maxlen=event_sync_delay+1)  # sync on the previous event according to parameter
         self.habana_module = None
         self.use_hpu = use_hpu
@@ -50,7 +51,7 @@ class DeviceTimer(object):
         self._sync()
         return time.time() - self.start_time
 
-    def check_drop_compute_throw(self):
+    def check_drop_compute_throw(self, name=""):
         if not self.is_started():
             return False
 
@@ -59,6 +60,8 @@ class DeviceTimer(object):
         #    print(f"current_time: {current_time}, global_drop_threshold: {self.drop_threshold}, global_enable_drop_compute {self.enable_drop_compute}")
         if self.enable_drop_compute and (current_time > self.drop_threshold):
             self.dropped = True
+            if self.debug:
+                print(f"reached timeout with module: {name}. current_time: {current_time}, global_drop_threshold: {self.drop_threshold}")
             raise ComputeTimeout("")
 
 

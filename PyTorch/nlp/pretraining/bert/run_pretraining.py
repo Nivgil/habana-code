@@ -595,7 +595,7 @@ def set_hooks(module, models_to_hook):
     def get_hook_func(module_name: str):
         def log_time(*args):
             htcore.mark_step()
-            global_drop_timer.check_drop_compute_throw()
+            global_drop_timer.check_drop_compute_throw(module_name)
         return log_time
 
     expression = re.compile("|".join(models_to_hook))
@@ -1128,7 +1128,6 @@ def main():
 
                 loss_list.append(loss)
                 if is_optimizer_step:
-                    wait_event.synchronize()
                     step_end = time.time()
                     lr_scheduler.step()  # learning rate warmup
                     if torch.distributed.is_initialized():
@@ -1144,6 +1143,7 @@ def main():
                         htcore.mark_step()
                     global_drop_timer.reset()
                     global_drop_timer.start()
+                    global_drop_timer.debug = args.debug
                     global_drop_timer.drop_threshold = args.compute_threshold
                     global_drop_timer.enable_drop_compute = (global_step > 5 and (compute_state.threshold > 0))
                     compute_state.reset_state(
