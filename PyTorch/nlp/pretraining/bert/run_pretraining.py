@@ -57,6 +57,7 @@ from __future__ import print_function
 import argparse
 import collections
 import dataclasses
+import re
 import dllogger
 import h5py
 import numpy as np
@@ -83,6 +84,7 @@ import lamb
 
 import utils
 from compute_timer import DeviceTimer
+from compute_timer import ComputeTimeout
 
 try:
     import apex
@@ -115,6 +117,7 @@ avg_seq_per_pack = 1.0
 
 # Track whether a SIGTERM (cluster time up) has been handled
 timeout_sent = False
+global_drop_timer = DeviceTimer(use_hpu = True)
 
 
 def signal_handler(sig, frame):
@@ -246,10 +249,6 @@ class BertPretrainingCriterion(torch.nn.Module):
         )
         total_loss = masked_lm_loss + next_sentence_loss
         return total_loss
-
-
-class ComputeTimeout(Exception):
-    pass
 
 
 @dataclasses.dataclass
@@ -588,6 +587,27 @@ def setup_training(args):
     return device, args
 
 
+def set_hooks(module, models_to_hook):
+    try:
+        import habana_frameworks.torch.core as htcore
+    except ImportError:
+        assert False, "Could Not import habana_frameworks.torch.core"
+
+    def get_hook_func(module_name: str):
+        def log_time(*args):
+            htcore.mark_step()
+            global_drop_timer.check_drop_compute_throw()
+        return log_time
+
+    expression = re.compile("|".join(models_to_hook))
+    for name, module in module.named_modules():
+        if expression.fullmatch(name) is not None:
+            if utils.is_main_process():
+                print(f"Hooking module: {name}")
+            module.register_forward_hook(get_hook_func('_'.join([name, 'fwd'])))
+            #module.register_backward_hook(get_hook_func('_'.join([name, 'bwd'])))
+
+
 def prepare_model_and_optimizer(args, device):
 
     # Prepare model
@@ -731,6 +751,15 @@ def prepare_model_and_optimizer(args, device):
 
     criterion = BertPretrainingCriterion(config.vocab_size)
 
+    hooked_modules = [
+        "bert.embeddings",
+        "bert.encoder.layer.\d+",
+        "bert.pooler",
+        "loss_fn"
+    ]
+
+    set_hooks(model, hooked_modules)
+
     return model, optimizer, lr_scheduler, checkpoint, global_step, criterion
 
 
@@ -825,17 +854,6 @@ def get_metadata_file_path(input_dir: str) -> str:
     metadata_file_name = metadata_file_name + '_metadata.json'
     metadata_file_path = os.path.join(head_tail[0],metadata_file_name)
     return metadata_file_path
-
-
-def drop_compute(timer : DeviceTimer,
-                 compute_state: ComputeState) -> bool:
-    if not timer.is_started():
-        return False
-
-    current_time = timer.elapsed()
-    if compute_state.enable_drop and (current_time > compute_state.threshold):
-        return True
-    return False
 
 
 def read_avg_seq_per_sample(input_dir: str, max_sequence_length) -> float:
@@ -940,7 +958,6 @@ def main():
 
     compute_state = ComputeState(device)
     starting_time = time.time()
-    drop_timer = DeviceTimer(use_hpu = True)
     # loop infinitely over epochs, termination is handled via iteration count
     time_logs = []
     while True:
@@ -1042,7 +1059,7 @@ def main():
 
                 batch = input_mask.shape[0]
                 sentence_length = input_mask.shape[1]
-                if not drop_compute(drop_timer, compute_state):
+                try:
                     fwd_start = time.time()
                     compute_dropped = False
                     # Forward pass
@@ -1092,13 +1109,14 @@ def main():
                         loss.backward()
                     compute_state.computed_batch_size += (
                         compute_state.mini_batch_size)
-                else:
+                except ComputeTimeout:
                     fwd_start = time.time()
-                    compute_dropped = True
+                    is_optimizer_step = True  # just straight to all-reduce
                     if args.debug:
                         print(f'Rank {utils.get_rank()} dropped '
                               f'{local_step}/'
                               f'{args.gradient_accumulation_steps}')
+                    pass
                 # End Compute
 
                 if args.use_lazy_mode and args.use_habana:
@@ -1120,8 +1138,10 @@ def main():
                               f'{compute_state.computed_batch_size}')
                     if args.use_lazy_mode and args.use_habana:
                         htcore.mark_step()
-                    drop_timer.reset()
-                    drop_timer.start()
+                    global_drop_timer.reset()
+                    global_drop_timer.start()
+                    global_drop_timer.drop_threshold = args.compute_threshold
+                    global_drop_timer.enable_drop_compute = (global_step > 5 and (compute_state.threshold > 0))
                     compute_state.reset_state(
                         compute_threshold=args.compute_threshold,
                         enable_drop=(global_step > 5 and (
