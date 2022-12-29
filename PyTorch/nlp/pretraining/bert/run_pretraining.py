@@ -3,53 +3,9 @@
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
 # Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
 
-"""
-BERT Pretraining script
-export MASTER_ADDR="localhost"
-export MASTER_PORT="12345"
-# packed data phase 1
-export DATA_DIR=/software/lfs/data/pytorch/bert/pretraining/hdf5_lower_case_1_seq_len_128/books_wiki_en_corpus/train_packed_new
-# non-packed data phase 1
-export DATA_DIR=/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus
-# non-packed data phase 2
-export DATA_DIR="/software/data/pytorch/bert_pretraining/hdf5_lower_case_1_seq_len_512_max_pred_80_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/books_wiki_en_corpus"
-# GPU - Phase 1
-mpirun -n 8 --bind-to core --map-by socket:PE=6 --rank-by core --report-bindings --allow-run-as-root \
-python run_pretraining.py --do_train --bert_model=bert-large-uncased --amp --hmp \
-      --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt --use_lazy_mode=True \
-      --config_file=./bert_config.json --allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
-      --output_dir=runs/checkpoints --use_fused_lamb --input_dir=${DATA_DIR} \
-      --train_batch_size=1024 --max_seq_length=128 --max_predictions_per_seq=20 --warmup_proportion=0.2843 \
-      --max_steps=7038 --num_steps_per_checkpoint=200 --learning_rate=0.006 --gradient_accumulation_steps=32 \
-      --enable_packed_data_mode False --compute_threshold=-1 --disable_progress_bar --log-dir=/tmp/log_directory
+"""BERT Pretraining script."""
 
-# HPU - Phase 1
-mpirun -n 8 --bind-to core --map-by socket:PE=6 --rank-by core --report-bindings --allow-run-as-root \
-python run_pretraining.py --do_train --bert_model=bert-large-uncased \
---hmp --hmp_bf16=./ops_bf16_bert_pt.txt --hmp_fp32=./ops_fp32_bert_pt.txt \
---use_lazy_mode=False --config_file=./bert_config.json \
---allreduce_post_accumulation --allreduce_post_accumulation_fp16 \
---output_dir=runs/checkpoints \
---input_dir=${DATA_DIR} --train_batch_size=8192 --max_seq_length=128 \
---max_predictions_per_seq=20 --warmup_proportion=0.2843 --max_steps=7038 \
---num_steps_per_checkpoint=20000 --learning_rate=0.006 \
---gradient_accumulation_steps=128 --enable_packed_data_mode False \
---disable_progress_bar --use_habana --log-dir=/tmp/log_directory
 
-# HPU - Phase 2
-mpirun -n 8 --bind-to core --map-by socket:PE=6 --rank-by core --report-bindings --allow-run-as-root \
-python run_pretraining.py --do_train --bert_model=bert-large-uncased --hmp \
---hmp_bf16=ops_bf16_bert_pt.txt --hmp_fp32=ops_fp32_bert_pt.txt \
---config_file=bert_config.json --use_habana --allreduce_post_accumulation \
---allreduce_post_accumulation_fp16 --log-dir=/tmp/log_directory \
---output_dir=/tmp/results/checkpoints --use_fused_lamb --input_dir=${DATA_DIR} \
---train_batch_size=4096 --max_seq_length=512 --max_predictions_per_seq=80 \
---warmup_proportion=0.128 --max_steps=300 --num_steps_per_checkpoint=20000 \
---learning_rate=0.004 --gradient_accumulation_steps=512 \
---enable_packed_data_mode False --phase1_end_step=7038 --phase2 \
---disable_progress_bar --skip_checkpoint --debug=True
---compute_threshold=-1
-"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
