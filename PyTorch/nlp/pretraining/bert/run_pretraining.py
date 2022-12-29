@@ -254,6 +254,12 @@ def parse_arguments():
                         required=True,
                         help="The output directory where the model checkpoints will be written.")
 
+    parser.add_argument("--checkpoint_dir",
+                        default=None,
+                        type=str,
+                        required=True,
+                        help="Directory where the model checkpoint will be loaded.")
+
     ## Other parameters
     parser.add_argument("--init_checkpoint",
                         default=None,
@@ -581,14 +587,14 @@ def prepare_model_and_optimizer(args, device):
     else:
         if args.resume_step == -1 and not args.init_checkpoint:
             model_names = [
-                f for f in os.listdir(args.output_dir) if f.endswith('.pt')]
+                f for f in os.listdir(args.checkpoint_dir) if f.endswith('.pt')]
             args.resume_step = max([int(x.split('.pt')[0].split('_')[1].strip()) for x in model_names])
 
         global_step = args.resume_step if not args.init_checkpoint else 0
 
         if not args.init_checkpoint:
             checkpoint = torch.load(
-                os.path.join(args.output_dir, f'ckpt_{global_step}.pt'),
+                os.path.join(args.checkpoint_dir, f'ckpt_{global_step}.pt'),
                 map_location='cpu'
             )
         else:
